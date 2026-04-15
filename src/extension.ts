@@ -2,8 +2,8 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as child_process from "child_process";
+import * as os from "os";
 import { OperationCancelled, sendChunked, normalizeText, sleep } from "./chunker";
-import { serializeBlocks, type ContentBlock } from "./serializer";
 
 let activePanel: vscode.WebviewPanel | null = null;
 const terminalIds = new WeakMap<vscode.Terminal, string>();
@@ -45,7 +45,6 @@ function terminalId(term: vscode.Terminal): string {
 }
 
 const IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".gif", ".webp"];
-const IMAGE_PATH_REGEX = /(?:^|\s)((?:\/|\.\/|~\/)[^\s]+\.(?:png|jpe?g|gif|webp))(?:\s|$)/gim;
 
 function isImageFile(filePath: string): boolean {
   const ext = path.extname(filePath).toLowerCase();
@@ -55,11 +54,11 @@ function isImageFile(filePath: string): boolean {
 function getMimeType(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase();
   switch (ext) {
-    case ".png": return "image/png";
+    case ".png":  return "image/png";
     case ".jpg": case ".jpeg": return "image/jpeg";
-    case ".gif": return "image/gif";
+    case ".gif":  return "image/gif";
     case ".webp": return "image/webp";
-    default: return "application/octet-stream";
+    default:      return "application/octet-stream";
   }
 }
 
@@ -79,49 +78,107 @@ function ensureStorageDir(storageDir: string): void {
   }
 }
 
+// ── Clipboard image grab ─────────────────────────────────────────────────
+
 /**
- * Try to grab an image from the system clipboard using pngpaste (macOS).
- * Returns the saved file path, or undefined if no image in clipboard.
+ * Try to grab an image from the system clipboard and save it.
+ * Uses built-in macOS osascript (no brew install needed), with pngpaste as fast fallback.
  */
 async function pasteImageFromClipboard(): Promise<string | undefined> {
   const storageDir = getImageStorageDir();
-  if (!storageDir) {
-    vscode.window.showErrorMessage("No workspace folder open.");
-    return undefined;
-  }
+  if (!storageDir) return undefined;
   ensureStorageDir(storageDir);
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const fileName = `paste-${timestamp}.png`;
   const filePath = path.join(storageDir, fileName);
 
-  // Try pngpaste (macOS)
-  try {
-    child_process.execSync(`pngpaste "${filePath}"`, { timeout: 5000 });
-    if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
-      return filePath;
-    }
-  } catch {
-    // pngpaste not installed or no image in clipboard
-  }
+  // Method 1: pngpaste (fast, if installed)
+  if (tryPngPaste(filePath)) return filePath;
 
-  // Try xclip (Linux)
-  try {
-    child_process.execSync(
-      `xclip -selection clipboard -t image/png -o > "${filePath}"`,
-      { timeout: 5000, shell: "/bin/bash" }
-    );
-    if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
-      return filePath;
-    }
-  } catch {
-    // xclip not available or no image
-  }
+  // Method 2: osascript + AppKit bridge (built-in on macOS, no install needed)
+  if (tryOsascriptAppKit(filePath)) return filePath;
 
-  // Cleanup empty file if created
-  try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+  // Method 3: xclip (Linux)
+  if (tryXclip(filePath)) return filePath;
+
+  // Method 4: PowerShell (Windows)
+  if (tryPowerShell(filePath)) return filePath;
+
+  // Cleanup empty file if any method created one
+  try { if (fs.existsSync(filePath) && fs.statSync(filePath).size === 0) fs.unlinkSync(filePath); } catch {}
 
   return undefined;
+}
+
+function tryPngPaste(outputPath: string): boolean {
+  try {
+    child_process.execSync(`pngpaste "${outputPath}" 2>/dev/null`, { timeout: 3000 });
+    return fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0;
+  } catch {
+    return false;
+  }
+}
+
+function tryOsascriptAppKit(outputPath: string): boolean {
+  // Use AppleScript with Objective-C bridge — built into macOS, no external tools
+  const script = `
+use framework "AppKit"
+set pb to current application's NSPasteboard's generalPasteboard()
+set imgClasses to {current application's NSImage}
+if (pb's canReadObjectForClasses:imgClasses options:(missing value)) then
+  set imgList to (pb's readObjectsForClasses:imgClasses options:(missing value))
+  set img to item 1 of imgList
+  set tiffData to img's TIFFRepresentation()
+  set rep to (current application's NSBitmapImageRep's imageRepWithData:tiffData)
+  set pngData to (rep's representationUsingType:(current application's NSBitmapImageTypePNG) properties:(missing value))
+  pngData's writeToFile:"${outputPath}" atomically:true
+  return "ok"
+else
+  return "no_image"
+end if
+`;
+  try {
+    const result = child_process.spawnSync("osascript", ["-"], {
+      input: script,
+      timeout: 5000,
+      encoding: "utf8",
+    });
+    const output = (result.stdout || "").trim();
+    if (output === "ok" && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+function tryXclip(outputPath: string): boolean {
+  try {
+    child_process.execSync(
+      `xclip -selection clipboard -t image/png -o > "${outputPath}" 2>/dev/null`,
+      { timeout: 3000, shell: "/bin/bash" }
+    );
+    return fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0;
+  } catch {
+    return false;
+  }
+}
+
+function tryPowerShell(outputPath: string): boolean {
+  try {
+    const psScript = `
+$img = Get-Clipboard -Format Image
+if ($img) {
+  $img.Save('${outputPath.replace(/'/g, "''")}')
+  Write-Output 'ok'
+} else {
+  Write-Output 'no_image'
+}`;
+    const result = child_process.execSync(`powershell -Command "${psScript}"`, { timeout: 5000 }).toString().trim();
+    return result === "ok" && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0;
+  } catch {
+    return false;
+  }
 }
 
 async function readImageAsDataUri(filePath: string): Promise<string | undefined> {
@@ -157,7 +214,6 @@ function openPastePanel(context: vscode.ExtensionContext) {
   );
   activePanel = panel;
 
-  // Per-terminal drafts (stored as plain text)
   const drafts = new Map<vscode.Terminal, string>();
   const terminalsById = new Map<string, vscode.Terminal>();
   const rememberTerminal = (term: vscode.Terminal) => {
@@ -226,52 +282,38 @@ function openPastePanel(context: vscode.ExtensionContext) {
 
       if (!selected || selected.length === 0) return;
 
-      // For image files, also send preview data
       const paths: string[] = [];
       const imagePreviews: Array<{ path: string; dataUri: string; fileName: string }> = [];
 
       for (const uri of selected) {
         const filePath = uri.fsPath;
         paths.push(filePath);
-
         if (isImageFile(filePath)) {
           const dataUri = await readImageAsDataUri(filePath);
           if (dataUri) {
-            imagePreviews.push({
-              path: filePath,
-              dataUri,
-              fileName: path.basename(filePath),
-            });
+            imagePreviews.push({ path: filePath, dataUri, fileName: path.basename(filePath) });
           }
         }
       }
 
-      panel.webview.postMessage({
-        type: "insertFilePaths",
-        paths,
-        imagePreviews,
-      });
+      panel.webview.postMessage({ type: "insertFilePaths", paths, imagePreviews });
       return;
     }
 
-    // --- PASTE IMAGE FROM CLIPBOARD ---
-    if (msg.type === "pasteImage") {
+    // --- CHECK CLIPBOARD FOR IMAGE (auto-triggered on paste) ---
+    if (msg.type === "checkClipboardImage") {
       const savedPath = await pasteImageFromClipboard();
       if (savedPath) {
         const dataUri = await readImageAsDataUri(savedPath);
         panel.webview.postMessage({
-          type: "insertFilePaths",
-          paths: [savedPath],
-          imagePreviews: dataUri ? [{
-            path: savedPath,
-            dataUri,
-            fileName: path.basename(savedPath),
-          }] : [],
+          type: "clipboardImageResult",
+          found: true,
+          path: savedPath,
+          dataUri: dataUri || "",
+          fileName: path.basename(savedPath),
         });
       } else {
-        vscode.window.showInformationMessage(
-          "No image found in clipboard. On macOS, install pngpaste: brew install pngpaste"
-        );
+        panel.webview.postMessage({ type: "clipboardImageResult", found: false });
       }
       return;
     }
@@ -288,11 +330,7 @@ function openPastePanel(context: vscode.ExtensionContext) {
         if (fs.existsSync(resolved) && isImageFile(resolved)) {
           const dataUri = await readImageAsDataUri(resolved);
           if (dataUri) {
-            results.push({
-              path: imgPath,
-              dataUri,
-              fileName: path.basename(imgPath),
-            });
+            results.push({ path: imgPath, dataUri, fileName: path.basename(imgPath) });
           }
         }
       }
@@ -374,7 +412,6 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     --cp-radius: 6px;
     --cp-transition: 150ms ease;
   }
-
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
   body {
@@ -388,7 +425,7 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     overflow: hidden;
   }
 
-  /* ── Header ─────────────────────────────── */
+  /* ── Header ────────── */
   .header {
     display: flex;
     align-items: center;
@@ -398,57 +435,33 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     margin-bottom: 10px;
     flex-shrink: 0;
   }
-  .header-left {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .header h2 {
-    font-size: 13px;
-    font-weight: 600;
-    letter-spacing: 0.01em;
-    opacity: 0.88;
-  }
+  .header-left { display: flex; align-items: center; gap: 10px; }
+  .header h2 { font-size: 13px; font-weight: 600; letter-spacing: 0.01em; opacity: 0.88; }
   .header-icon { font-size: 15px; opacity: 0.7; }
   .target {
-    font-size: 11px;
-    font-weight: 500;
-    opacity: 0.7;
+    font-size: 11px; font-weight: 500; opacity: 0.7;
     background: var(--vscode-badge-background);
     color: var(--vscode-badge-foreground);
-    padding: 2px 10px;
-    border-radius: 99px;
-    letter-spacing: 0.01em;
+    padding: 2px 10px; border-radius: 99px;
   }
 
-  /* ── Status ─────────────────────────────── */
+  /* ── Status ────────── */
   #status {
-    display: none;
-    text-align: center;
-    padding: 8px;
-    font-size: 12px;
-    font-weight: 500;
-    opacity: 0.85;
-    flex-shrink: 0;
-    border-radius: var(--cp-radius);
-    margin-bottom: 6px;
+    display: none; text-align: center; padding: 8px;
+    font-size: 12px; font-weight: 500; opacity: 0.85;
+    flex-shrink: 0; border-radius: var(--cp-radius); margin-bottom: 6px;
     background: color-mix(in srgb, var(--vscode-editor-foreground) 5%, transparent);
   }
   #status.active { display: block; }
 
-  /* ── Image Preview Strip ────────────────── */
+  /* ── Image Preview Strip ─── */
   #image-strip {
-    display: none;
-    flex-shrink: 0;
-    max-height: 260px;
-    overflow-y: auto;
-    margin-bottom: 8px;
-    border-radius: var(--cp-radius);
+    display: none; flex-shrink: 0; max-height: 260px; overflow-y: auto;
+    margin-bottom: 8px; border-radius: var(--cp-radius);
     border: 1px solid color-mix(in srgb, var(--vscode-panel-border) 50%, transparent);
     background: color-mix(in srgb, var(--vscode-editor-background) 60%, var(--vscode-input-background));
   }
   #image-strip.visible { display: block; }
-
   #image-strip::-webkit-scrollbar { width: 6px; }
   #image-strip::-webkit-scrollbar-track { background: transparent; }
   #image-strip::-webkit-scrollbar-thumb {
@@ -457,60 +470,34 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
   }
 
   .img-card {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 8px 10px;
+    display: flex; align-items: center; gap: 10px; padding: 8px 10px;
     border-bottom: 1px solid color-mix(in srgb, var(--vscode-panel-border) 30%, transparent);
     animation: cp-slide-in 200ms ease-out;
   }
   .img-card:last-child { border-bottom: none; }
 
   .img-card-thumb {
-    width: 48px;
-    height: 48px;
-    border-radius: 4px;
-    object-fit: cover;
+    width: 48px; height: 48px; border-radius: 4px;
+    object-fit: cover; flex-shrink: 0; cursor: pointer;
     background: color-mix(in srgb, var(--vscode-editor-foreground) 5%, transparent);
-    flex-shrink: 0;
-    cursor: pointer;
     transition: transform var(--cp-transition);
   }
   .img-card-thumb:hover { transform: scale(1.05); }
 
-  .img-card-info {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-  }
+  .img-card-info { flex: 1; min-width: 0; overflow: hidden; }
   .img-card-name {
-    font-size: 12px;
-    font-weight: 500;
-    opacity: 0.85;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    font-size: 12px; font-weight: 500; opacity: 0.85;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .img-card-path {
-    font-size: 10px;
-    opacity: 0.4;
+    font-size: 10px; opacity: 0.4; margin-top: 2px;
     font-family: var(--vscode-editor-font-family, monospace);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    margin-top: 2px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-
   .img-card-remove {
-    flex-shrink: 0;
-    background: none;
-    border: none;
-    color: var(--vscode-editor-foreground);
-    opacity: 0.3;
-    cursor: pointer;
-    font-size: 14px;
-    padding: 4px 6px;
-    border-radius: 4px;
+    flex-shrink: 0; background: none; border: none;
+    color: var(--vscode-editor-foreground); opacity: 0.3;
+    cursor: pointer; font-size: 14px; padding: 4px 6px; border-radius: 4px;
     transition: opacity var(--cp-transition), background var(--cp-transition);
   }
   .img-card-remove:hover {
@@ -518,41 +505,28 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     background: color-mix(in srgb, var(--vscode-editor-foreground) 8%, transparent);
   }
 
-  /* Expanded preview overlay */
+  /* Expanded preview */
   .img-expanded-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 100;
-    background: rgba(0,0,0,0.7);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    animation: cp-fade-in 150ms ease-out;
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(0,0,0,0.7); display: flex;
+    align-items: center; justify-content: center;
+    cursor: pointer; animation: cp-fade-in 150ms ease-out;
   }
   .img-expanded-overlay img {
-    max-width: 90%;
-    max-height: 90%;
-    object-fit: contain;
-    border-radius: 8px;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    max-width: 90%; max-height: 90%; object-fit: contain;
+    border-radius: 8px; box-shadow: 0 20px 60px rgba(0,0,0,0.5);
   }
 
-  /* ── Textarea ───────────────────────────── */
+  /* ── Textarea ──────── */
   #input {
-    flex: 1;
-    width: 100%;
-    min-height: 0;
+    flex: 1; width: 100%; min-height: 0;
     background: var(--vscode-input-background);
     color: var(--vscode-input-foreground);
     border: 1px solid var(--vscode-input-border, color-mix(in srgb, var(--vscode-panel-border) 50%, transparent));
-    border-radius: var(--cp-radius);
-    padding: 12px 14px;
+    border-radius: var(--cp-radius); padding: 12px 14px;
     font-family: var(--vscode-editor-font-family, 'SF Mono', Menlo, Consolas, monospace);
     font-size: var(--vscode-editor-font-size, 13px);
-    line-height: 1.65;
-    resize: none;
-    outline: none;
+    line-height: 1.65; resize: none; outline: none;
     transition: border-color var(--cp-transition), box-shadow var(--cp-transition);
   }
   #input:focus {
@@ -564,7 +538,6 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     font-style: italic;
   }
   #input.disabled { opacity: 0.45; pointer-events: none; }
-
   #input::-webkit-scrollbar { width: 8px; }
   #input::-webkit-scrollbar-track { background: transparent; }
   #input::-webkit-scrollbar-thumb {
@@ -575,60 +548,42 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     background: color-mix(in srgb, var(--vscode-editor-foreground) 30%, transparent);
   }
 
-  /* ── Footer ─────────────────────────────── */
+  /* Paste hint toast */
+  #paste-toast {
+    display: none; position: fixed; bottom: 80px; left: 50%;
+    transform: translateX(-50%);
+    background: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    padding: 6px 14px; border-radius: 99px;
+    font-size: 11px; font-weight: 500; opacity: 0;
+    transition: opacity 200ms ease;
+    z-index: 50; pointer-events: none;
+  }
+  #paste-toast.show { display: block; opacity: 1; }
+
+  /* ── Footer ────────── */
   .footer {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    padding-top: 10px;
-    margin-top: 10px;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; padding-top: 10px; margin-top: 10px;
     border-top: 1px solid color-mix(in srgb, var(--vscode-panel-border) 60%, transparent);
     flex-shrink: 0;
   }
-  .footer-left {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    min-width: 0;
-    flex-wrap: wrap;
-  }
-  .footer-right {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-shrink: 0;
-  }
-  .footer .keys {
-    font-size: 11px;
-    opacity: 0.45;
-    white-space: nowrap;
-  }
+  .footer-left { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
+  .footer-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+  .footer .keys { font-size: 11px; opacity: 0.45; white-space: nowrap; }
   .footer .keys kbd {
     background: var(--vscode-keybindingLabel-background, color-mix(in srgb, var(--vscode-editor-foreground) 8%, transparent));
     border: 1px solid var(--vscode-keybindingLabel-border, color-mix(in srgb, var(--vscode-editor-foreground) 12%, transparent));
-    border-radius: 3px;
-    padding: 1px 5px;
-    font-family: inherit;
-    font-size: 10px;
+    border-radius: 3px; padding: 1px 5px; font-family: inherit; font-size: 10px;
   }
-  .stat {
-    font-size: 11px;
-    opacity: 0.4;
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
+  .stat { font-size: 11px; opacity: 0.4; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
-  /* ── Buttons ────────────────────────────── */
+  /* ── Buttons ───────── */
   button {
     border: 1px solid var(--vscode-button-border, transparent);
-    border-radius: var(--cp-radius);
-    padding: 4px 10px;
-    font-family: inherit;
-    font-size: 11px;
-    font-weight: 500;
-    line-height: 18px;
-    cursor: pointer;
+    border-radius: var(--cp-radius); padding: 4px 10px;
+    font-family: inherit; font-size: 11px; font-weight: 500;
+    line-height: 18px; cursor: pointer;
     transition: background var(--cp-transition), opacity var(--cp-transition);
     white-space: nowrap;
   }
@@ -636,16 +591,12 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     background: var(--vscode-button-secondaryBackground);
     color: var(--vscode-button-secondaryForeground);
   }
-  button.secondary:hover {
-    background: var(--vscode-button-secondaryHoverBackground);
-  }
+  button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
   button.toggle {
     background: transparent;
     border: 1px solid color-mix(in srgb, var(--vscode-panel-border) 80%, transparent);
-    color: var(--vscode-editor-foreground);
-    opacity: 0.55;
-    font-size: 11px;
-    padding: 3px 8px;
+    color: var(--vscode-editor-foreground); opacity: 0.55;
+    font-size: 11px; padding: 3px 8px;
   }
   button.toggle:hover { opacity: 0.85; }
   button.toggle.active {
@@ -653,17 +604,10 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     background: color-mix(in srgb, var(--vscode-focusBorder) 12%, transparent);
     border-color: var(--vscode-focusBorder);
   }
-  button:focus {
-    outline: 1px solid var(--vscode-focusBorder);
-    outline-offset: 2px;
-  }
+  button:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
   button:disabled { cursor: default; opacity: 0.4; }
 
-  /* ── Animations ─────────────────────────── */
-  @keyframes cp-fade-in {
-    from { opacity: 0; }
-    to   { opacity: 1; }
-  }
+  @keyframes cp-fade-in { from { opacity: 0; } to { opacity: 1; } }
   @keyframes cp-slide-in {
     from { opacity: 0; transform: translateY(-6px); }
     to   { opacity: 1; transform: translateY(0); }
@@ -681,13 +625,13 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
 
   <div id="status"></div>
   <div id="image-strip"></div>
+  <div id="paste-toast">Checking clipboard for image…</div>
 
-  <textarea id="input" placeholder="Paste your content here…" autofocus>${escaped}</textarea>
+  <textarea id="input" placeholder="Paste your content here… (text and images are both supported)" autofocus>${escaped}</textarea>
 
   <div class="footer">
     <div class="footer-left">
       <button id="browse-files" class="secondary" type="button" title="Insert file or folder paths at cursor">Browse Files…</button>
-      <button id="paste-image" class="secondary" type="button" title="Paste image from system clipboard (requires pngpaste on macOS)">📷 Paste Image</button>
       <button id="toggle-preview" class="toggle" type="button" title="Toggle image preview display">👁 Preview</button>
       <div class="keys">
         <kbd>⌘↵</kbd> Insert &nbsp;
@@ -707,18 +651,18 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     const target = document.getElementById('target');
     const imageStrip = document.getElementById('image-strip');
     const browseFiles = document.getElementById('browse-files');
-    const pasteImageBtn = document.getElementById('paste-image');
     const togglePreview = document.getElementById('toggle-preview');
+    const pasteToast = document.getElementById('paste-toast');
 
     let currentTerminalId = ${JSON.stringify(tid)};
     let showPreview = true;
     let lastSelectionStart = input.value.length;
     let lastSelectionEnd = input.value.length;
+    let scanTimer = null;
+    let toastTimer = null;
 
     // Image previews: path -> { dataUri, fileName }
     const imagePreviews = new Map();
-    // Debounce timer for scanning
-    let scanTimer = null;
 
     input.focus();
     input.setSelectionRange(input.value.length, input.value.length);
@@ -730,11 +674,9 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
       const text = input.value;
       const chars = [...text].length;
       const bytes = new TextEncoder().encode(text).length;
-      if (bytes !== chars) {
-        counter.textContent = chars + ' chars \\u00b7 ' + formatBytes(bytes);
-      } else {
-        counter.textContent = chars + ' chars';
-      }
+      counter.textContent = bytes !== chars
+        ? chars + ' chars \\u00b7 ' + formatBytes(bytes)
+        : chars + ' chars';
     }
 
     function formatBytes(b) {
@@ -752,7 +694,32 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
       vscode.postMessage({ type: 'draftChanged', text: input.value, terminalId: currentTerminalId });
     }
 
-    function insertAtSelection(text) {
+    function insertAtCursor(text) {
+      const start = Math.max(0, Math.min(lastSelectionStart, input.value.length));
+      const end = Math.max(start, Math.min(lastSelectionEnd, input.value.length));
+
+      // Ensure we're on a new line for image paths
+      let prefix = '';
+      if (start > 0 && input.value[start - 1] !== '\\n') {
+        prefix = '\\n';
+      }
+      let suffix = '';
+      if (end < input.value.length && input.value[end] !== '\\n') {
+        suffix = '\\n';
+      }
+
+      const insertion = prefix + text + suffix;
+      input.value = input.value.slice(0, start) + insertion + input.value.slice(end);
+      const cursor = start + insertion.length;
+      input.focus();
+      input.setSelectionRange(cursor, cursor);
+      rememberSelection();
+      updateCounter();
+      notifyDraftChanged();
+      scheduleScanForImages();
+    }
+
+    function insertTextAtSelection(text) {
       const start = Math.max(0, Math.min(lastSelectionStart, input.value.length));
       const end = Math.max(start, Math.min(lastSelectionEnd, input.value.length));
       input.value = input.value.slice(0, start) + text + input.value.slice(end);
@@ -765,6 +732,13 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
       scheduleScanForImages();
     }
 
+    function showToast(msg, duration) {
+      pasteToast.textContent = msg;
+      pasteToast.classList.add('show');
+      if (toastTimer) clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => pasteToast.classList.remove('show'), duration || 2000);
+    }
+
     function escapeH(s) {
       const d = document.createElement('div');
       d.textContent = s;
@@ -773,17 +747,16 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
 
     // ── Image path scanning ──────────────────
 
-    const IMAGE_PATH_RE = /(?:^|\\s)((?:\\/|\\.\\/|~\\/)[^\\s]+\\.(?:png|jpe?g|gif|webp))(?:\\s|$)/gim;
+    const IMG_RE = /(?:^|[\\s])((?:\\/|\\.\\/|~\\/)[^\\s]+\\.(?:png|jpe?g|gif|webp))(?=[\\s]|$)/gim;
 
     function scanImagePaths() {
       const text = input.value;
       const paths = [];
       let m;
-      IMAGE_PATH_RE.lastIndex = 0;
-      while ((m = IMAGE_PATH_RE.exec(text)) !== null) {
+      IMG_RE.lastIndex = 0;
+      while ((m = IMG_RE.exec(text)) !== null) {
         paths.push(m[1]);
       }
-      // Find paths we don't have previews for yet
       const unknown = paths.filter(p => !imagePreviews.has(p));
       if (unknown.length > 0) {
         vscode.postMessage({ type: 'resolveImages', paths: unknown });
@@ -804,8 +777,6 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
         imageStrip.classList.remove('visible');
         return;
       }
-
-      // Only show paths we have previews for
       const visible = paths.filter(p => imagePreviews.has(p));
       if (visible.length === 0) {
         imageStrip.innerHTML = '';
@@ -827,18 +798,13 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
 
       imageStrip.classList.add('visible');
 
-      // Attach listeners
       imageStrip.querySelectorAll('.img-card-thumb').forEach(thumb => {
-        thumb.addEventListener('click', () => {
-          showExpandedImage(thumb.src, thumb.alt);
-        });
+        thumb.addEventListener('click', () => showExpandedImage(thumb.src, thumb.alt));
       });
-
       imageStrip.querySelectorAll('.img-card-remove').forEach(btn => {
         btn.addEventListener('click', () => {
           const card = btn.closest('.img-card');
           const imgPath = card.dataset.path;
-          // Remove the path from textarea
           removePathFromTextarea(imgPath);
           imagePreviews.delete(imgPath);
           scheduleScanForImages();
@@ -847,11 +813,9 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     }
 
     function removePathFromTextarea(imgPath) {
-      const text = input.value;
-      // Remove the path (and surrounding whitespace/newlines)
-      const escaped = imgPath.replace(/[.*+?^\${}()|[\\]\\\\]/g, '\\\\$&');
-      const re = new RegExp('\\\\n?' + escaped + '\\\\n?', 'g');
-      input.value = text.replace(re, '\\n').replace(/^\\n+|\\n+$/g, '');
+      const esc = imgPath.replace(/[.*+?^\${}()|[\\]\\\\]/g, '\\\\$&');
+      const re = new RegExp('\\\\n?' + esc + '\\\\n?', 'g');
+      input.value = input.value.replace(re, '\\n').replace(/^\\n+|\\n+$/g, '');
       updateCounter();
       notifyDraftChanged();
     }
@@ -859,10 +823,26 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     function showExpandedImage(src, alt) {
       const overlay = document.createElement('div');
       overlay.className = 'img-expanded-overlay';
-      overlay.innerHTML = '<img src="' + src + '" alt="' + escapeH(alt) + '" />';
+      overlay.innerHTML = '<img src="' + src + '" alt="' + escapeH(alt || '') + '" />';
       overlay.addEventListener('click', () => overlay.remove());
       document.body.appendChild(overlay);
     }
+
+    // ── Paste handler: auto-detect images ────
+
+    input.addEventListener('paste', (e) => {
+      // Check if this paste contains text
+      const textData = (e.clipboardData && e.clipboardData.getData('text/plain')) || '';
+
+      if (textData.length === 0) {
+        // No text pasted → likely an image in clipboard
+        // Prevent default (nothing useful would happen anyway)
+        e.preventDefault();
+        showToast('Checking clipboard for image…', 3000);
+        vscode.postMessage({ type: 'checkClipboardImage' });
+      }
+      // If text exists, let textarea handle it normally (v1 behavior preserved)
+    });
 
     // ── Event listeners ──────────────────────
 
@@ -881,11 +861,6 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     browseFiles.addEventListener('click', () => {
       rememberSelection();
       vscode.postMessage({ type: 'browseFiles' });
-    });
-
-    pasteImageBtn.addEventListener('click', () => {
-      rememberSelection();
-      vscode.postMessage({ type: 'pasteImage' });
     });
 
     togglePreview.addEventListener('click', () => {
@@ -923,18 +898,27 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
       if (msg.type === 'insertFilePaths') {
         const paths = Array.isArray(msg.paths) ? msg.paths.filter(p => typeof p === 'string' && p.length > 0) : [];
         if (paths.length > 0) {
-          insertAtSelection(paths.join(' '));
+          insertTextAtSelection(paths.join(' '));
         } else {
           input.focus();
         }
-        // Store any image previews
         const previews = msg.imagePreviews || [];
         for (const img of previews) {
           imagePreviews.set(img.path, { dataUri: img.dataUri, fileName: img.fileName });
         }
-        if (previews.length > 0) {
+        if (previews.length > 0) scheduleScanForImages();
+      }
+
+      if (msg.type === 'clipboardImageResult') {
+        pasteToast.classList.remove('show');
+        if (msg.found) {
+          // Image found in clipboard — insert its path
+          insertAtCursor(msg.path);
+          imagePreviews.set(msg.path, { dataUri: msg.dataUri, fileName: msg.fileName });
           scheduleScanForImages();
+          showToast('Image pasted ✓', 1500);
         }
+        // If not found, silently do nothing (user just pasted non-text non-image content)
       }
 
       if (msg.type === 'imagePreviewsResolved') {
@@ -948,14 +932,10 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
       if (msg.type === 'status') {
         status.textContent = msg.text;
         status.className = 'active';
-        if (msg.text === 'Done') {
-          status.style.color = 'var(--vscode-terminal-ansiGreen, #4ec9b0)';
-        } else {
-          status.style.color = '';
-        }
+        status.style.color = msg.text === 'Done'
+          ? 'var(--vscode-terminal-ansiGreen, #4ec9b0)' : '';
         input.classList.add('disabled');
         browseFiles.disabled = true;
-        pasteImageBtn.disabled = true;
         togglePreview.disabled = true;
       }
 
@@ -963,12 +943,10 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
         status.className = '';
         input.classList.remove('disabled');
         browseFiles.disabled = false;
-        pasteImageBtn.disabled = false;
         togglePreview.disabled = false;
       }
     });
 
-    // Initial scan
     updateCounter();
     scheduleScanForImages();
   </script>
