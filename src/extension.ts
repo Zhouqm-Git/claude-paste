@@ -17,7 +17,12 @@ const terminalIds = new WeakMap<vscode.Terminal, string>();
 let nextTerminalId = 1;
 
 export function activate(context: vscode.ExtensionContext) {
+  // Create output channel immediately so it's visible in Output panel
+  outputChannel = vscode.window.createOutputChannel("Claude Paste");
+  log("Claude Paste extension activated");
+
   context.subscriptions.push(
+    outputChannel,
     vscode.commands.registerCommand("claude-paste.openPanel", () => {
       openPastePanel(context);
     })
@@ -221,6 +226,67 @@ async function readImageAsDataUri(filePath: string): Promise<string | undefined>
   }
 }
 
+/**
+ * Check if a string looks like an image URL.
+ */
+function isImageUrl(text: string): boolean {
+  if (!text) return false;
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) return false;
+  // Check URL path for image extension (ignore query params)
+  try {
+    const url = new URL(trimmed);
+    return /\.(png|jpe?g|gif|webp|bmp|svg)(\?|$)/i.test(url.pathname);
+  } catch {
+    return /\.(png|jpe?g|gif|webp)(\?|$)/i.test(trimmed);
+  }
+}
+
+/**
+ * Download an image from a URL and save it locally.
+ */
+async function downloadImageFromUrl(imageUrl: string): Promise<string | undefined> {
+  const storageDir = getImageStorageDir();
+  if (!storageDir) return undefined;
+  ensureStorageDir(storageDir);
+
+  // Determine filename from URL
+  let ext = ".png";
+  try {
+    const url = new URL(imageUrl);
+    const urlPath = url.pathname;
+    const match = urlPath.match(/\.(png|jpe?g|gif|webp)$/i);
+    if (match) ext = match[0].toLowerCase();
+  } catch {}
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const fileName = `web-${timestamp}${ext}`;
+  const filePath = path.join(storageDir, fileName);
+
+  log(`Downloading image from URL: ${imageUrl}`);
+  log(`Saving to: ${filePath}`);
+
+  try {
+    const result = child_process.spawnSync("curl", [
+      "-sL",           // silent, follow redirects
+      "--max-time", "10",  // 10 second timeout
+      "-o", filePath,
+      imageUrl,
+    ], { timeout: 15000 });
+
+    if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
+      log(`Download success: ${fs.statSync(filePath).size} bytes`);
+      return filePath;
+    }
+    log(`Download failed: file empty or missing. stderr=${(result.stderr || "").toString().slice(0, 200)}`);
+  } catch (e) {
+    log(`Download error: ${e instanceof Error ? e.message : e}`);
+  }
+
+  try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+  return undefined;
+}
+
 // ── Panel ────────────────────────────────────────────────────────────────
 
 function openPastePanel(context: vscode.ExtensionContext) {
@@ -332,19 +398,46 @@ function openPastePanel(context: vscode.ExtensionContext) {
 
     // --- CHECK CLIPBOARD FOR IMAGE (auto-triggered on paste) ---
     if (msg.type === "checkClipboardImage") {
-      const savedPath = await pasteImageFromClipboard();
-      if (savedPath) {
-        const dataUri = await readImageAsDataUri(savedPath);
+      const pastedText = (msg.pastedText || "").trim();
+      log(`checkClipboardImage: pastedText="${pastedText.slice(0, 100)}"`);
+
+      // Strategy 1: Check native clipboard for image data (screenshots, etc.)
+      const nativePath = await pasteImageFromClipboard();
+      if (nativePath) {
+        log(`Native clipboard image found: ${nativePath}`);
+        const dataUri = await readImageAsDataUri(nativePath);
         panel.webview.postMessage({
           type: "clipboardImageResult",
           found: true,
-          path: savedPath,
+          path: nativePath,
           dataUri: dataUri || "",
-          fileName: path.basename(savedPath),
+          fileName: path.basename(nativePath),
+          replaceText: false,  // Don't replace, just add
         });
-      } else {
-        panel.webview.postMessage({ type: "clipboardImageResult", found: false });
+        return;
       }
+
+      // Strategy 2: If pasted text is an image URL, download it
+      if (isImageUrl(pastedText)) {
+        log(`Pasted text is image URL, downloading: ${pastedText}`);
+        const downloadedPath = await downloadImageFromUrl(pastedText);
+        if (downloadedPath) {
+          const dataUri = await readImageAsDataUri(downloadedPath);
+          panel.webview.postMessage({
+            type: "clipboardImageResult",
+            found: true,
+            path: downloadedPath,
+            dataUri: dataUri || "",
+            fileName: path.basename(downloadedPath),
+            replaceText: true,  // Replace URL with local path
+            originalText: pastedText,
+          });
+          return;
+        }
+      }
+
+      log("No image found in clipboard or URL");
+      panel.webview.postMessage({ type: "clipboardImageResult", found: false });
       return;
     }
 
@@ -863,20 +956,17 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     input.addEventListener('paste', (e) => {
       const textData = (e.clipboardData && e.clipboardData.getData('text/plain')) || '';
 
-      // ALWAYS check clipboard for image data (even when text exists).
-      // Scenarios:
-      //   - Pure image (screenshot) → no text, clipboard has image → insert path
-      //   - Web image copy → text is URL, clipboard ALSO has image → insert path
-      //   - Pure text → no image in clipboard → extension returns found:false → nothing happens
-      //
-      // For pure image paste, prevent default (textarea can't handle images).
-      // For text paste, let textarea handle text normally AND check for image.
+      // For pure image paste (no text), prevent default since textarea can't handle it.
       if (textData.length === 0) {
         e.preventDefault();
       }
 
-      showToast('Checking clipboard for image…', 4000);
-      vscode.postMessage({ type: 'checkClipboardImage', hasText: textData.length > 0 });
+      // ALWAYS tell extension to check clipboard.
+      // Sends the pasted text so extension can:
+      //   1. Check native clipboard for image data (screenshots)
+      //   2. Detect if pasted text is an image URL and download it
+      showToast('Checking clipboard for image…', 5000);
+      vscode.postMessage({ type: 'checkClipboardImage', pastedText: textData });
     });
 
     // ── Event listeners ──────────────────────
@@ -947,13 +1037,26 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
       if (msg.type === 'clipboardImageResult') {
         pasteToast.classList.remove('show');
         if (msg.found) {
-          // Image found in clipboard — insert its path
-          insertAtCursor(msg.path);
+          if (msg.replaceText && msg.originalText) {
+            // Replace the pasted URL with the local path
+            const val = input.value;
+            const idx = val.lastIndexOf(msg.originalText);
+            if (idx !== -1) {
+              input.value = val.slice(0, idx) + msg.path + val.slice(idx + msg.originalText.length);
+            } else {
+              insertAtCursor(msg.path);
+            }
+          } else {
+            // Native clipboard image — insert path at cursor
+            insertAtCursor(msg.path);
+          }
           imagePreviews.set(msg.path, { dataUri: msg.dataUri, fileName: msg.fileName });
           scheduleScanForImages();
+          updateCounter();
+          notifyDraftChanged();
           showToast('Image pasted ✓', 1500);
         }
-        // If not found, silently do nothing (user just pasted non-text non-image content)
+        // If not found, silently do nothing
       }
 
       if (msg.type === 'imagePreviewsResolved') {
