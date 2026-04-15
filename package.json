@@ -1,0 +1,43 @@
+{
+  "name": "claude-paste",
+  "displayName": "Claude Paste",
+  "description": "Paste large text into Claude Code (and other CLI agents) without freezing the terminal",
+  "version": "1.0.0",
+  "license": "MIT",
+  "keywords": ["claude", "paste", "terminal", "ai", "cli"],
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onCommand:claude-paste.openPanel"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claude-paste.openPanel",
+        "title": "Claude Paste: Open Panel"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "claude-paste.openPanel",
+        "key": "cmd+shift+v",
+        "mac": "cmd+shift+v",
+        "when": "terminalFocus"
+      },
+      {
+        "command": "claude-paste.openPanel",
+        "key": "ctrl+shift+v",
+        "when": "terminalFocus && !isMac"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "tsc -p ./",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
