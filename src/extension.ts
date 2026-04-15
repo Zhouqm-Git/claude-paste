@@ -168,6 +168,28 @@ function openPastePanel() {
       return;
     }
 
+    // --- BROWSE FILES ---
+    if (msg.type === "browseFiles") {
+      const selected = await vscode.window.showOpenDialog({
+        canSelectFiles: true,
+        canSelectFolders: true,
+        canSelectMany: true,
+        defaultUri: vscode.workspace.workspaceFolders?.[0]?.uri,
+        openLabel: "Insert Path",
+        title: "Select files or folders to insert",
+      });
+
+      if (!selected || selected.length === 0) {
+        return;
+      }
+
+      panel.webview.postMessage({
+        type: "insertFilePaths",
+        paths: selected.map((uri) => uri.fsPath),
+      });
+      return;
+    }
+
     // --- SUBMIT ---
     if (msg.type === "submit") {
       const text = normalizeText(msg.text || "");
@@ -336,9 +358,17 @@ function getWebviewHtml(initialContent: string, terminalName: string, terminalId
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 12px;
     padding-top: 8px;
     margin-top: 8px;
     border-top: 1px solid var(--vscode-panel-border);
+  }
+  .footer-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+    flex-wrap: wrap;
   }
   .footer .keys { font-size: 12px; opacity: 0.5; }
   .footer .keys kbd {
@@ -348,6 +378,30 @@ function getWebviewHtml(initialContent: string, terminalName: string, terminalId
     padding: 1px 5px;
     font-family: inherit;
     font-size: 11px;
+  }
+  button {
+    border: 1px solid var(--vscode-button-border, transparent);
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-family: inherit;
+    font-size: 12px;
+    line-height: 18px;
+    cursor: pointer;
+  }
+  button.secondary {
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+  }
+  button.secondary:hover {
+    background: var(--vscode-button-secondaryHoverBackground);
+  }
+  button:focus {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: 2px;
+  }
+  button:disabled {
+    cursor: default;
+    opacity: 0.5;
   }
   #char-count { font-size: 12px; opacity: 0.5; }
 </style>
@@ -360,9 +414,12 @@ function getWebviewHtml(initialContent: string, terminalName: string, terminalId
   <div id="status"></div>
   <textarea id="input" placeholder="Paste your content here..." autofocus>${escaped}</textarea>
   <div class="footer">
-    <div class="keys">
-      <kbd>Cmd+Enter</kbd> Insert &nbsp;
-      <kbd>Esc</kbd> Cancel
+    <div class="footer-left">
+      <button id="browse-files" class="secondary" type="button" title="Insert file or folder paths at cursor">Browse Files...</button>
+      <div class="keys">
+        <kbd>Cmd+Enter</kbd> Insert &nbsp;
+        <kbd>Esc</kbd> Cancel
+      </div>
     </div>
     <span id="char-count">${charCount} chars</span>
   </div>
@@ -372,7 +429,10 @@ function getWebviewHtml(initialContent: string, terminalName: string, terminalId
     const counter = document.getElementById('char-count');
     const status = document.getElementById('status');
     const target = document.getElementById('target');
+    const browseFiles = document.getElementById('browse-files');
     let currentTerminalId = ${JSON.stringify(terminalId)};
+    let lastSelectionStart = input.value.length;
+    let lastSelectionEnd = input.value.length;
 
     input.focus();
     input.setSelectionRange(input.value.length, input.value.length);
@@ -381,9 +441,41 @@ function getWebviewHtml(initialContent: string, terminalName: string, terminalId
       counter.textContent = [...input.value].length + ' chars';
     }
 
-    input.addEventListener('input', () => {
-      updateCounter();
+    function rememberSelection() {
+      lastSelectionStart = input.selectionStart;
+      lastSelectionEnd = input.selectionEnd;
+    }
+
+    function notifyDraftChanged() {
       vscode.postMessage({ type: 'draftChanged', text: input.value, terminalId: currentTerminalId });
+    }
+
+    function insertAtSelection(text) {
+      const start = Math.max(0, Math.min(lastSelectionStart, input.value.length));
+      const end = Math.max(start, Math.min(lastSelectionEnd, input.value.length));
+      input.value = input.value.slice(0, start) + text + input.value.slice(end);
+      const cursor = start + text.length;
+      input.focus();
+      input.setSelectionRange(cursor, cursor);
+      rememberSelection();
+      updateCounter();
+      notifyDraftChanged();
+    }
+
+    input.addEventListener('input', () => {
+      rememberSelection();
+      updateCounter();
+      notifyDraftChanged();
+    });
+    input.addEventListener('click', rememberSelection);
+    input.addEventListener('keyup', rememberSelection);
+    input.addEventListener('select', rememberSelection);
+    input.addEventListener('focus', rememberSelection);
+
+    browseFiles.addEventListener('mousedown', rememberSelection);
+    browseFiles.addEventListener('click', () => {
+      rememberSelection();
+      vscode.postMessage({ type: 'browseFiles' });
     });
 
     window.addEventListener('message', (e) => {
@@ -395,6 +487,15 @@ function getWebviewHtml(initialContent: string, terminalName: string, terminalId
         updateCounter();
         input.focus();
         input.setSelectionRange(input.value.length, input.value.length);
+        rememberSelection();
+      }
+      if (msg.type === 'insertFilePaths') {
+        const paths = Array.isArray(msg.paths) ? msg.paths.filter((p) => typeof p === 'string' && p.length > 0) : [];
+        if (paths.length > 0) {
+          insertAtSelection(paths.join(' '));
+        } else {
+          input.focus();
+        }
       }
       if (msg.type === 'status') {
         status.textContent = msg.text;
@@ -405,10 +506,12 @@ function getWebviewHtml(initialContent: string, terminalName: string, terminalId
           status.style.color = '';
         }
         input.classList.add('disabled');
+        browseFiles.disabled = true;
       }
       if (msg.type === 'resetStatus') {
         status.className = '';
         input.classList.remove('disabled');
+        browseFiles.disabled = false;
       }
     });
 
