@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
+import * as child_process from "child_process";
 import { OperationCancelled, sendChunked, normalizeText, sleep } from "./chunker";
 import { serializeBlocks, type ContentBlock } from "./serializer";
 
@@ -44,6 +45,7 @@ function terminalId(term: vscode.Terminal): string {
 }
 
 const IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".gif", ".webp"];
+const IMAGE_PATH_REGEX = /(?:^|\s)((?:\/|\.\/|~\/)[^\s]+\.(?:png|jpe?g|gif|webp))(?:\s|$)/gim;
 
 function isImageFile(filePath: string): boolean {
   const ext = path.extname(filePath).toLowerCase();
@@ -67,39 +69,59 @@ function getImageStorageDir(): string | undefined {
   return path.join(wsFolder.uri.fsPath, ".claude-paste-images");
 }
 
-async function saveClipboardImage(dataUri: string, mimeType: string): Promise<string | undefined> {
-  const storageDir = getImageStorageDir();
-  if (!storageDir) {
-    vscode.window.showErrorMessage("No workspace folder open. Cannot save pasted image.");
-    return undefined;
-  }
-
-  // Ensure directory exists
+function ensureStorageDir(storageDir: string): void {
   if (!fs.existsSync(storageDir)) {
     fs.mkdirSync(storageDir, { recursive: true });
-    // Create .gitignore
     const gitignorePath = path.join(storageDir, ".gitignore");
     if (!fs.existsSync(gitignorePath)) {
       fs.writeFileSync(gitignorePath, "*\n!.gitignore\n", "utf8");
     }
   }
+}
 
-  // Determine extension from mime
-  let ext = ".png";
-  if (mimeType.includes("jpeg") || mimeType.includes("jpg")) ext = ".jpg";
-  else if (mimeType.includes("gif")) ext = ".gif";
-  else if (mimeType.includes("webp")) ext = ".webp";
+/**
+ * Try to grab an image from the system clipboard using pngpaste (macOS).
+ * Returns the saved file path, or undefined if no image in clipboard.
+ */
+async function pasteImageFromClipboard(): Promise<string | undefined> {
+  const storageDir = getImageStorageDir();
+  if (!storageDir) {
+    vscode.window.showErrorMessage("No workspace folder open.");
+    return undefined;
+  }
+  ensureStorageDir(storageDir);
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const fileName = `paste-${timestamp}${ext}`;
+  const fileName = `paste-${timestamp}.png`;
   const filePath = path.join(storageDir, fileName);
 
-  // Decode base64 data URI
-  const base64Data = dataUri.replace(/^data:image\/\w+;base64,/, "");
-  const buffer = Buffer.from(base64Data, "base64");
-  fs.writeFileSync(filePath, buffer);
+  // Try pngpaste (macOS)
+  try {
+    child_process.execSync(`pngpaste "${filePath}"`, { timeout: 5000 });
+    if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
+      return filePath;
+    }
+  } catch {
+    // pngpaste not installed or no image in clipboard
+  }
 
-  return filePath;
+  // Try xclip (Linux)
+  try {
+    child_process.execSync(
+      `xclip -selection clipboard -t image/png -o > "${filePath}"`,
+      { timeout: 5000, shell: "/bin/bash" }
+    );
+    if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
+      return filePath;
+    }
+  } catch {
+    // xclip not available or no image
+  }
+
+  // Cleanup empty file if created
+  try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+
+  return undefined;
 }
 
 async function readImageAsDataUri(filePath: string): Promise<string | undefined> {
@@ -135,7 +157,7 @@ function openPastePanel(context: vscode.ExtensionContext) {
   );
   activePanel = panel;
 
-  // Per-terminal drafts stored as serialized HTML
+  // Per-terminal drafts (stored as plain text)
   const drafts = new Map<vscode.Terminal, string>();
   const terminalsById = new Map<string, vscode.Terminal>();
   const rememberTerminal = (term: vscode.Terminal) => {
@@ -186,7 +208,7 @@ function openPastePanel(context: vscode.ExtensionContext) {
     if (msg.type === "draftChanged") {
       const draftTerm = terminalsById.get(msg.terminalId);
       if (draftTerm && !draftTerm.exitStatus) {
-        drafts.set(draftTerm, msg.html || "");
+        drafts.set(draftTerm, msg.text || "");
       }
       return;
     }
@@ -202,73 +224,87 @@ function openPastePanel(context: vscode.ExtensionContext) {
         title: "Select files or folders to insert",
       });
 
-      if (!selected || selected.length === 0) {
-        return;
-      }
+      if (!selected || selected.length === 0) return;
 
-      // Separate image files from non-image files
-      const imagePaths: Array<{ path: string; dataUri: string; fileName: string }> = [];
-      const textPaths: string[] = [];
+      // For image files, also send preview data
+      const paths: string[] = [];
+      const imagePreviews: Array<{ path: string; dataUri: string; fileName: string }> = [];
 
       for (const uri of selected) {
         const filePath = uri.fsPath;
+        paths.push(filePath);
+
         if (isImageFile(filePath)) {
           const dataUri = await readImageAsDataUri(filePath);
           if (dataUri) {
-            imagePaths.push({
+            imagePreviews.push({
               path: filePath,
               dataUri,
               fileName: path.basename(filePath),
             });
-          } else {
-            textPaths.push(filePath);
           }
-        } else {
-          textPaths.push(filePath);
         }
       }
 
-      // Send non-image file paths as text
-      if (textPaths.length > 0) {
+      panel.webview.postMessage({
+        type: "insertFilePaths",
+        paths,
+        imagePreviews,
+      });
+      return;
+    }
+
+    // --- PASTE IMAGE FROM CLIPBOARD ---
+    if (msg.type === "pasteImage") {
+      const savedPath = await pasteImageFromClipboard();
+      if (savedPath) {
+        const dataUri = await readImageAsDataUri(savedPath);
         panel.webview.postMessage({
           type: "insertFilePaths",
-          paths: textPaths,
+          paths: [savedPath],
+          imagePreviews: dataUri ? [{
+            path: savedPath,
+            dataUri,
+            fileName: path.basename(savedPath),
+          }] : [],
         });
-      }
-
-      // Send image files with previews
-      if (imagePaths.length > 0) {
-        panel.webview.postMessage({
-          type: "insertImages",
-          images: imagePaths,
-        });
+      } else {
+        vscode.window.showInformationMessage(
+          "No image found in clipboard. On macOS, install pngpaste: brew install pngpaste"
+        );
       }
       return;
     }
 
-    // --- CLIPBOARD IMAGE PASTE ---
-    if (msg.type === "imagePasted") {
-      const { dataUri, mimeType } = msg;
-      const savedPath = await saveClipboardImage(dataUri, mimeType);
-      if (savedPath) {
-        panel.webview.postMessage({
-          type: "insertImages",
-          images: [{
-            path: savedPath,
-            dataUri,
-            fileName: path.basename(savedPath),
-          }],
-        });
+    // --- RESOLVE IMAGE PREVIEWS (from text scanning) ---
+    if (msg.type === "resolveImages") {
+      const imagePaths: string[] = msg.paths || [];
+      const results: Array<{ path: string; dataUri: string; fileName: string }> = [];
+
+      for (const imgPath of imagePaths) {
+        const resolved = imgPath.startsWith("~")
+          ? imgPath.replace("~", process.env.HOME || "")
+          : imgPath;
+        if (fs.existsSync(resolved) && isImageFile(resolved)) {
+          const dataUri = await readImageAsDataUri(resolved);
+          if (dataUri) {
+            results.push({
+              path: imgPath,
+              dataUri,
+              fileName: path.basename(imgPath),
+            });
+          }
+        }
       }
+
+      panel.webview.postMessage({ type: "imagePreviewsResolved", images: results });
       return;
     }
 
     // --- SUBMIT ---
     if (msg.type === "submit") {
-      const blocks: ContentBlock[] = msg.blocks || [];
-      const text = normalizeText(serializeBlocks(blocks));
+      const text = normalizeText(msg.text || "");
 
-      // Resolve target at submit time
       const term = vscode.window.activeTerminal;
       if (!term) {
         vscode.window.showErrorMessage("No active terminal.");
@@ -325,6 +361,9 @@ function openPastePanel(context: vscode.ExtensionContext) {
 // ── Webview HTML ─────────────────────────────────────────────────────────
 
 function getWebviewHtml(initialContent: string, terminalName: string, tid: string): string {
+  const escaped = escapeHtml(initialContent);
+  const charCount = [...initialContent].length;
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -334,7 +373,6 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
   :root {
     --cp-radius: 6px;
     --cp-transition: 150ms ease;
-    --cp-gap: 10px;
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -342,7 +380,7 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
   body {
     background: var(--vscode-editor-background);
     color: var(--vscode-editor-foreground);
-    font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+    font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
     display: flex;
     flex-direction: column;
     height: 100vh;
@@ -351,7 +389,6 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
   }
 
   /* ── Header ─────────────────────────────── */
-
   .header {
     display: flex;
     align-items: center;
@@ -361,25 +398,18 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     margin-bottom: 10px;
     flex-shrink: 0;
   }
-
   .header-left {
     display: flex;
     align-items: center;
     gap: 10px;
   }
-
   .header h2 {
     font-size: 13px;
     font-weight: 600;
     letter-spacing: 0.01em;
     opacity: 0.88;
   }
-
-  .header-icon {
-    font-size: 15px;
-    opacity: 0.7;
-  }
-
+  .header-icon { font-size: 15px; opacity: 0.7; }
   .target {
     font-size: 11px;
     font-weight: 500;
@@ -392,11 +422,10 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
   }
 
   /* ── Status ─────────────────────────────── */
-
   #status {
     display: none;
     text-align: center;
-    padding: 10px;
+    padding: 8px;
     font-size: 12px;
     font-weight: 500;
     opacity: 0.85;
@@ -407,9 +436,110 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
   }
   #status.active { display: block; }
 
-  /* ── Editor ─────────────────────────────── */
+  /* ── Image Preview Strip ────────────────── */
+  #image-strip {
+    display: none;
+    flex-shrink: 0;
+    max-height: 260px;
+    overflow-y: auto;
+    margin-bottom: 8px;
+    border-radius: var(--cp-radius);
+    border: 1px solid color-mix(in srgb, var(--vscode-panel-border) 50%, transparent);
+    background: color-mix(in srgb, var(--vscode-editor-background) 60%, var(--vscode-input-background));
+  }
+  #image-strip.visible { display: block; }
 
-  #editor {
+  #image-strip::-webkit-scrollbar { width: 6px; }
+  #image-strip::-webkit-scrollbar-track { background: transparent; }
+  #image-strip::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--vscode-editor-foreground) 15%, transparent);
+    border-radius: 99px;
+  }
+
+  .img-card {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    border-bottom: 1px solid color-mix(in srgb, var(--vscode-panel-border) 30%, transparent);
+    animation: cp-slide-in 200ms ease-out;
+  }
+  .img-card:last-child { border-bottom: none; }
+
+  .img-card-thumb {
+    width: 48px;
+    height: 48px;
+    border-radius: 4px;
+    object-fit: cover;
+    background: color-mix(in srgb, var(--vscode-editor-foreground) 5%, transparent);
+    flex-shrink: 0;
+    cursor: pointer;
+    transition: transform var(--cp-transition);
+  }
+  .img-card-thumb:hover { transform: scale(1.05); }
+
+  .img-card-info {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .img-card-name {
+    font-size: 12px;
+    font-weight: 500;
+    opacity: 0.85;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .img-card-path {
+    font-size: 10px;
+    opacity: 0.4;
+    font-family: var(--vscode-editor-font-family, monospace);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-top: 2px;
+  }
+
+  .img-card-remove {
+    flex-shrink: 0;
+    background: none;
+    border: none;
+    color: var(--vscode-editor-foreground);
+    opacity: 0.3;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    transition: opacity var(--cp-transition), background var(--cp-transition);
+  }
+  .img-card-remove:hover {
+    opacity: 0.85;
+    background: color-mix(in srgb, var(--vscode-editor-foreground) 8%, transparent);
+  }
+
+  /* Expanded preview overlay */
+  .img-expanded-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    background: rgba(0,0,0,0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    animation: cp-fade-in 150ms ease-out;
+  }
+  .img-expanded-overlay img {
+    max-width: 90%;
+    max-height: 90%;
+    object-fit: contain;
+    border-radius: 8px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+
+  /* ── Textarea ───────────────────────────── */
+  #input {
     flex: 1;
     width: 100%;
     min-height: 0;
@@ -418,177 +548,34 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     border: 1px solid var(--vscode-input-border, color-mix(in srgb, var(--vscode-panel-border) 50%, transparent));
     border-radius: var(--cp-radius);
     padding: 12px 14px;
-    font-family: var(--vscode-editor-font-family, 'SF Mono', Menlo, 'Cascadia Code', Consolas, monospace);
+    font-family: var(--vscode-editor-font-family, 'SF Mono', Menlo, Consolas, monospace);
     font-size: var(--vscode-editor-font-size, 13px);
     line-height: 1.65;
+    resize: none;
     outline: none;
-    overflow-y: auto;
-    white-space: pre-wrap;
-    word-wrap: break-word;
-    overflow-wrap: break-word;
-    cursor: text;
     transition: border-color var(--cp-transition), box-shadow var(--cp-transition);
   }
-
-  #editor:focus {
+  #input:focus {
     border-color: var(--vscode-focusBorder);
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--vscode-focusBorder) 30%, transparent);
   }
-
-  #editor:empty::before {
-    content: 'Paste your content here…';
+  #input::placeholder {
     color: var(--vscode-input-placeholderForeground, color-mix(in srgb, var(--vscode-editor-foreground) 35%, transparent));
-    pointer-events: none;
     font-style: italic;
   }
+  #input.disabled { opacity: 0.45; pointer-events: none; }
 
-  #editor.disabled {
-    opacity: 0.45;
-    pointer-events: none;
-  }
-
-  /* Custom scrollbar */
-  #editor::-webkit-scrollbar { width: 8px; }
-  #editor::-webkit-scrollbar-track { background: transparent; }
-  #editor::-webkit-scrollbar-thumb {
+  #input::-webkit-scrollbar { width: 8px; }
+  #input::-webkit-scrollbar-track { background: transparent; }
+  #input::-webkit-scrollbar-thumb {
     background: color-mix(in srgb, var(--vscode-editor-foreground) 18%, transparent);
     border-radius: 99px;
   }
-  #editor::-webkit-scrollbar-thumb:hover {
+  #input::-webkit-scrollbar-thumb:hover {
     background: color-mix(in srgb, var(--vscode-editor-foreground) 30%, transparent);
   }
 
-  /* ── Image Block (preview mode) ────────── */
-
-  .image-block {
-    display: block;
-    margin: 8px 0;
-    border-radius: var(--cp-radius);
-    border: 1px solid var(--vscode-panel-border);
-    overflow: hidden;
-    user-select: none;
-    transition: border-color var(--cp-transition), box-shadow var(--cp-transition);
-    animation: cp-fade-in 200ms ease-out;
-    background: color-mix(in srgb, var(--vscode-editor-background) 60%, var(--vscode-input-background));
-  }
-
-  .image-block:hover {
-    border-color: var(--vscode-focusBorder);
-    box-shadow: 0 0 0 1px color-mix(in srgb, var(--vscode-focusBorder) 20%, transparent);
-  }
-
-  .image-block-header {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 10px;
-    font-size: 11px;
-    font-weight: 500;
-    border-bottom: 1px solid color-mix(in srgb, var(--vscode-panel-border) 50%, transparent);
-  }
-
-  .image-block-icon { font-size: 13px; flex-shrink: 0; }
-
-  .image-block-name {
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    opacity: 0.8;
-  }
-
-  .image-block-remove {
-    flex-shrink: 0;
-    background: none;
-    border: none;
-    color: var(--vscode-editor-foreground);
-    opacity: 0.35;
-    cursor: pointer;
-    font-size: 14px;
-    line-height: 1;
-    padding: 2px 4px;
-    border-radius: 3px;
-    transition: opacity var(--cp-transition), background var(--cp-transition);
-  }
-  .image-block-remove:hover {
-    opacity: 0.9;
-    background: color-mix(in srgb, var(--vscode-editor-foreground) 10%, transparent);
-  }
-
-  .image-block-preview {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    max-height: 280px;
-    overflow: hidden;
-    background: color-mix(in srgb, var(--vscode-editor-foreground) 3%, transparent);
-  }
-
-  .image-block-preview img {
-    max-width: 100%;
-    max-height: 280px;
-    object-fit: contain;
-    display: block;
-  }
-
-  .image-block-footer {
-    padding: 5px 10px;
-    font-size: 10px;
-    opacity: 0.45;
-    font-family: var(--vscode-editor-font-family, monospace);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    border-top: 1px solid color-mix(in srgb, var(--vscode-panel-border) 40%, transparent);
-  }
-
-  /* ── Image Chip (path-only mode) ───────── */
-
-  .image-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    margin: 2px 1px;
-    padding: 2px 8px 2px 6px;
-    background: var(--vscode-badge-background);
-    color: var(--vscode-badge-foreground);
-    border-radius: 99px;
-    font-size: 11px;
-    font-family: var(--vscode-font-family, sans-serif);
-    font-weight: 500;
-    user-select: none;
-    white-space: nowrap;
-    vertical-align: middle;
-    animation: cp-fade-in 150ms ease-out;
-    transition: opacity var(--cp-transition);
-  }
-
-  .image-chip:hover { opacity: 0.85; }
-
-  .image-chip-icon { font-size: 11px; }
-
-  .image-chip-name {
-    max-width: 180px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .image-chip-remove {
-    background: none;
-    border: none;
-    color: inherit;
-    opacity: 0.5;
-    cursor: pointer;
-    font-size: 12px;
-    line-height: 1;
-    padding: 0 2px;
-    margin-left: 2px;
-    transition: opacity var(--cp-transition);
-  }
-  .image-chip-remove:hover { opacity: 1; }
-
   /* ── Footer ─────────────────────────────── */
-
   .footer {
     display: flex;
     align-items: center;
@@ -599,7 +586,6 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     border-top: 1px solid color-mix(in srgb, var(--vscode-panel-border) 60%, transparent);
     flex-shrink: 0;
   }
-
   .footer-left {
     display: flex;
     align-items: center;
@@ -607,20 +593,17 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     min-width: 0;
     flex-wrap: wrap;
   }
-
   .footer-right {
     display: flex;
     align-items: center;
     gap: 10px;
     flex-shrink: 0;
   }
-
   .footer .keys {
     font-size: 11px;
     opacity: 0.45;
     white-space: nowrap;
   }
-
   .footer .keys kbd {
     background: var(--vscode-keybindingLabel-background, color-mix(in srgb, var(--vscode-editor-foreground) 8%, transparent));
     border: 1px solid var(--vscode-keybindingLabel-border, color-mix(in srgb, var(--vscode-editor-foreground) 12%, transparent));
@@ -629,7 +612,6 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     font-family: inherit;
     font-size: 10px;
   }
-
   .stat {
     font-size: 11px;
     opacity: 0.4;
@@ -638,7 +620,6 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
   }
 
   /* ── Buttons ────────────────────────────── */
-
   button {
     border: 1px solid var(--vscode-button-border, transparent);
     border-radius: var(--cp-radius);
@@ -651,7 +632,6 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     transition: background var(--cp-transition), opacity var(--cp-transition);
     white-space: nowrap;
   }
-
   button.secondary {
     background: var(--vscode-button-secondaryBackground);
     color: var(--vscode-button-secondaryForeground);
@@ -659,35 +639,33 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
   button.secondary:hover {
     background: var(--vscode-button-secondaryHoverBackground);
   }
-
   button.toggle {
     background: transparent;
     border: 1px solid color-mix(in srgb, var(--vscode-panel-border) 80%, transparent);
     color: var(--vscode-editor-foreground);
-    opacity: 0.6;
+    opacity: 0.55;
     font-size: 11px;
     padding: 3px 8px;
   }
-  button.toggle:hover { opacity: 0.9; }
+  button.toggle:hover { opacity: 0.85; }
   button.toggle.active {
     opacity: 0.9;
     background: color-mix(in srgb, var(--vscode-focusBorder) 12%, transparent);
     border-color: var(--vscode-focusBorder);
   }
-
   button:focus {
     outline: 1px solid var(--vscode-focusBorder);
     outline-offset: 2px;
   }
-  button:disabled {
-    cursor: default;
-    opacity: 0.4;
-  }
+  button:disabled { cursor: default; opacity: 0.4; }
 
   /* ── Animations ─────────────────────────── */
-
   @keyframes cp-fade-in {
-    from { opacity: 0; transform: translateY(4px); }
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+  @keyframes cp-slide-in {
+    from { opacity: 0; transform: translateY(-6px); }
     to   { opacity: 1; transform: translateY(0); }
   }
 </style>
@@ -702,12 +680,14 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
   </div>
 
   <div id="status"></div>
+  <div id="image-strip"></div>
 
-  <div id="editor" contenteditable="true" role="textbox" aria-multiline="true" spellcheck="false">${escapeHtml(initialContent)}</div>
+  <textarea id="input" placeholder="Paste your content here…" autofocus>${escaped}</textarea>
 
   <div class="footer">
     <div class="footer-left">
-      <button id="browse-files" class="secondary" type="button" title="Insert file or folder paths">Browse Files…</button>
+      <button id="browse-files" class="secondary" type="button" title="Insert file or folder paths at cursor">Browse Files…</button>
+      <button id="paste-image" class="secondary" type="button" title="Paste image from system clipboard (requires pngpaste on macOS)">📷 Paste Image</button>
       <button id="toggle-preview" class="toggle" type="button" title="Toggle image preview display">👁 Preview</button>
       <div class="keys">
         <kbd>⌘↵</kbd> Insert &nbsp;
@@ -715,127 +695,43 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
       </div>
     </div>
     <div class="footer-right">
-      <span class="stat" id="char-count">0 chars</span>
+      <span class="stat" id="char-count">${charCount} chars</span>
     </div>
   </div>
 
   <script>
     const vscode = acquireVsCodeApi();
-    const editor = document.getElementById('editor');
+    const input = document.getElementById('input');
     const counter = document.getElementById('char-count');
     const status = document.getElementById('status');
     const target = document.getElementById('target');
+    const imageStrip = document.getElementById('image-strip');
     const browseFiles = document.getElementById('browse-files');
+    const pasteImageBtn = document.getElementById('paste-image');
     const togglePreview = document.getElementById('toggle-preview');
 
     let currentTerminalId = ${JSON.stringify(tid)};
     let showPreview = true;
-    let imageIdCounter = 0;
+    let lastSelectionStart = input.value.length;
+    let lastSelectionEnd = input.value.length;
 
-    editor.focus();
-    placeCaretAtEnd(editor);
+    // Image previews: path -> { dataUri, fileName }
+    const imagePreviews = new Map();
+    // Debounce timer for scanning
+    let scanTimer = null;
+
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+    togglePreview.classList.toggle('active', showPreview);
 
     // ── Utility ──────────────────────────────
 
-    function placeCaretAtEnd(el) {
-      const range = document.createRange();
-      range.selectNodeContents(el);
-      range.collapse(false);
-      const sel = window.getSelection();
-      sel.removeAllRanges();
-      sel.addRange(range);
-    }
-
-    function getTextContent() {
-      // Extract text, treating image blocks/chips as their path
-      let result = '';
-      for (const node of editor.childNodes) {
-        result += extractNodeText(node);
-      }
-      return result;
-    }
-
-    function extractNodeText(node) {
-      if (node.nodeType === Node.TEXT_NODE) {
-        return node.textContent || '';
-      }
-      if (node instanceof HTMLElement) {
-        if (node.dataset && node.dataset.path) {
-          return node.dataset.path;
-        }
-        if (node.tagName === 'BR') {
-          return '\\n';
-        }
-        // Recurse for other elements (e.g. div wrapping lines)
-        let text = '';
-        for (const child of node.childNodes) {
-          text += extractNodeText(child);
-        }
-        // Add newline after block elements
-        if (['DIV', 'P'].includes(node.tagName) && text.length > 0) {
-          text += '\\n';
-        }
-        return text;
-      }
-      return '';
-    }
-
-    function extractBlocks() {
-      const blocks = [];
-      for (const node of editor.childNodes) {
-        collectBlocks(node, blocks);
-      }
-      // Merge adjacent text blocks
-      const merged = [];
-      for (const block of blocks) {
-        if (block.type === 'text' && merged.length > 0 && merged[merged.length - 1].type === 'text') {
-          merged[merged.length - 1].text += block.text;
-        } else {
-          merged.push(block);
-        }
-      }
-      return merged;
-    }
-
-    function collectBlocks(node, blocks) {
-      if (node.nodeType === Node.TEXT_NODE) {
-        const text = node.textContent || '';
-        if (text.length > 0) {
-          blocks.push({ type: 'text', text });
-        }
-        return;
-      }
-      if (node instanceof HTMLElement) {
-        if (node.dataset && node.dataset.path &&
-            (node.classList.contains('image-block') || node.classList.contains('image-chip'))) {
-          blocks.push({
-            type: 'image',
-            path: node.dataset.path,
-            fileName: node.dataset.filename || '',
-          });
-          return;
-        }
-        if (node.tagName === 'BR') {
-          blocks.push({ type: 'text', text: '\\n' });
-          return;
-        }
-        // Block element: recurse, then add newline
-        const isBlock = ['DIV', 'P'].includes(node.tagName);
-        for (const child of node.childNodes) {
-          collectBlocks(child, blocks);
-        }
-        if (isBlock) {
-          blocks.push({ type: 'text', text: '\\n' });
-        }
-      }
-    }
-
     function updateCounter() {
-      const text = getTextContent();
+      const text = input.value;
       const chars = [...text].length;
       const bytes = new TextEncoder().encode(text).length;
       if (bytes !== chars) {
-        counter.textContent = chars + ' chars · ' + formatBytes(bytes);
+        counter.textContent = chars + ' chars \\u00b7 ' + formatBytes(bytes);
       } else {
         counter.textContent = chars + ' chars';
       }
@@ -847,65 +743,26 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
       return (b / 1048576).toFixed(1) + ' MB';
     }
 
-    function notifyDraftChanged() {
-      vscode.postMessage({
-        type: 'draftChanged',
-        html: editor.innerHTML,
-        terminalId: currentTerminalId,
-      });
+    function rememberSelection() {
+      lastSelectionStart = input.selectionStart;
+      lastSelectionEnd = input.selectionEnd;
     }
 
-    // ── Image rendering ──────────────────────
+    function notifyDraftChanged() {
+      vscode.postMessage({ type: 'draftChanged', text: input.value, terminalId: currentTerminalId });
+    }
 
-    function createImageBlock(path, dataUri, fileName) {
-      const id = 'img-' + (++imageIdCounter);
-
-      if (showPreview && dataUri) {
-        const block = document.createElement('div');
-        block.className = 'image-block';
-        block.contentEditable = 'false';
-        block.dataset.path = path;
-        block.dataset.filename = fileName;
-        block.dataset.datauri = dataUri;
-        block.id = id;
-        block.innerHTML =
-          '<div class="image-block-header">' +
-            '<span class="image-block-icon">🖼</span>' +
-            '<span class="image-block-name">' + escapeH(fileName) + '</span>' +
-            '<button class="image-block-remove" title="Remove image">✕</button>' +
-          '</div>' +
-          '<div class="image-block-preview">' +
-            '<img src="' + dataUri + '" alt="' + escapeH(fileName) + '" />' +
-          '</div>' +
-          '<div class="image-block-footer">' + escapeH(path) + '</div>';
-        block.querySelector('.image-block-remove').addEventListener('click', (e) => {
-          e.stopPropagation();
-          block.remove();
-          updateCounter();
-          notifyDraftChanged();
-        });
-        return block;
-      } else {
-        const chip = document.createElement('span');
-        chip.className = 'image-chip';
-        chip.contentEditable = 'false';
-        chip.dataset.path = path;
-        chip.dataset.filename = fileName;
-        if (dataUri) chip.dataset.datauri = dataUri;
-        chip.id = id;
-        chip.innerHTML =
-          '<span class="image-chip-icon">📎</span>' +
-          '<span class="image-chip-name">' + escapeH(fileName) + '</span>' +
-          '<button class="image-chip-remove" title="Remove">✕</button>';
-        chip.title = path;
-        chip.querySelector('.image-chip-remove').addEventListener('click', (e) => {
-          e.stopPropagation();
-          chip.remove();
-          updateCounter();
-          notifyDraftChanged();
-        });
-        return chip;
-      }
+    function insertAtSelection(text) {
+      const start = Math.max(0, Math.min(lastSelectionStart, input.value.length));
+      const end = Math.max(start, Math.min(lastSelectionEnd, input.value.length));
+      input.value = input.value.slice(0, start) + text + input.value.slice(end);
+      const cursor = start + text.length;
+      input.focus();
+      input.setSelectionRange(cursor, cursor);
+      rememberSelection();
+      updateCounter();
+      notifyDraftChanged();
+      scheduleScanForImages();
     }
 
     function escapeH(s) {
@@ -914,122 +771,133 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
       return d.innerHTML;
     }
 
-    function insertImageAtCaret(path, dataUri, fileName) {
-      const block = createImageBlock(path, dataUri, fileName);
-      const sel = window.getSelection();
+    // ── Image path scanning ──────────────────
 
-      if (sel && sel.rangeCount > 0 && editor.contains(sel.anchorNode)) {
-        const range = sel.getRangeAt(0);
-        range.deleteContents();
-        range.insertNode(block);
-        // Move caret after the inserted block
-        range.setStartAfter(block);
-        range.collapse(true);
-        sel.removeAllRanges();
-        sel.addRange(range);
-      } else {
-        editor.appendChild(block);
+    const IMAGE_PATH_RE = /(?:^|\\s)((?:\\/|\\.\\/|~\\/)[^\\s]+\\.(?:png|jpe?g|gif|webp))(?:\\s|$)/gim;
+
+    function scanImagePaths() {
+      const text = input.value;
+      const paths = [];
+      let m;
+      IMAGE_PATH_RE.lastIndex = 0;
+      while ((m = IMAGE_PATH_RE.exec(text)) !== null) {
+        paths.push(m[1]);
+      }
+      // Find paths we don't have previews for yet
+      const unknown = paths.filter(p => !imagePreviews.has(p));
+      if (unknown.length > 0) {
+        vscode.postMessage({ type: 'resolveImages', paths: unknown });
+      }
+      renderImageStrip(paths);
+    }
+
+    function scheduleScanForImages() {
+      if (scanTimer) clearTimeout(scanTimer);
+      scanTimer = setTimeout(scanImagePaths, 400);
+    }
+
+    // ── Image strip rendering ────────────────
+
+    function renderImageStrip(paths) {
+      if (!showPreview || paths.length === 0) {
+        imageStrip.innerHTML = '';
+        imageStrip.classList.remove('visible');
+        return;
       }
 
-      // Ensure there's a text node after the image for continued typing
-      if (!block.nextSibling || (block.nextSibling.nodeType !== Node.TEXT_NODE)) {
-        const spacer = document.createTextNode('\\n');
-        block.parentNode.insertBefore(spacer, block.nextSibling);
-        // Place caret after spacer
-        const r = document.createRange();
-        r.setStartAfter(spacer);
-        r.collapse(true);
-        const s = window.getSelection();
-        s.removeAllRanges();
-        s.addRange(r);
+      // Only show paths we have previews for
+      const visible = paths.filter(p => imagePreviews.has(p));
+      if (visible.length === 0) {
+        imageStrip.innerHTML = '';
+        imageStrip.classList.remove('visible');
+        return;
       }
 
+      imageStrip.innerHTML = visible.map(p => {
+        const info = imagePreviews.get(p);
+        return '<div class="img-card" data-path="' + escapeH(p) + '">' +
+          '<img class="img-card-thumb" src="' + info.dataUri + '" alt="' + escapeH(info.fileName) + '" title="Click to enlarge" />' +
+          '<div class="img-card-info">' +
+            '<div class="img-card-name">' + escapeH(info.fileName) + '</div>' +
+            '<div class="img-card-path">' + escapeH(p) + '</div>' +
+          '</div>' +
+          '<button class="img-card-remove" title="Remove from text">\\u2715</button>' +
+        '</div>';
+      }).join('');
+
+      imageStrip.classList.add('visible');
+
+      // Attach listeners
+      imageStrip.querySelectorAll('.img-card-thumb').forEach(thumb => {
+        thumb.addEventListener('click', () => {
+          showExpandedImage(thumb.src, thumb.alt);
+        });
+      });
+
+      imageStrip.querySelectorAll('.img-card-remove').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const card = btn.closest('.img-card');
+          const imgPath = card.dataset.path;
+          // Remove the path from textarea
+          removePathFromTextarea(imgPath);
+          imagePreviews.delete(imgPath);
+          scheduleScanForImages();
+        });
+      });
+    }
+
+    function removePathFromTextarea(imgPath) {
+      const text = input.value;
+      // Remove the path (and surrounding whitespace/newlines)
+      const escaped = imgPath.replace(/[.*+?^\${}()|[\\]\\\\]/g, '\\\\$&');
+      const re = new RegExp('\\\\n?' + escaped + '\\\\n?', 'g');
+      input.value = text.replace(re, '\\n').replace(/^\\n+|\\n+$/g, '');
       updateCounter();
       notifyDraftChanged();
     }
 
-    function rebuildImageDisplay() {
-      // Collect all image nodes, rebuild them with new display mode
-      const imageNodes = editor.querySelectorAll('.image-block, .image-chip');
-      for (const node of imageNodes) {
-        const p = node.dataset.path;
-        const f = node.dataset.filename;
-        const d = node.dataset.datauri || '';
-        const newNode = createImageBlock(p, d, f);
-        node.replaceWith(newNode);
-      }
+    function showExpandedImage(src, alt) {
+      const overlay = document.createElement('div');
+      overlay.className = 'img-expanded-overlay';
+      overlay.innerHTML = '<img src="' + src + '" alt="' + escapeH(alt) + '" />';
+      overlay.addEventListener('click', () => overlay.remove());
+      document.body.appendChild(overlay);
     }
 
     // ── Event listeners ──────────────────────
 
-    editor.addEventListener('input', () => {
+    input.addEventListener('input', () => {
+      rememberSelection();
       updateCounter();
       notifyDraftChanged();
+      scheduleScanForImages();
     });
+    input.addEventListener('click', rememberSelection);
+    input.addEventListener('keyup', rememberSelection);
+    input.addEventListener('select', rememberSelection);
+    input.addEventListener('focus', rememberSelection);
 
-    // Handle paste — intercept image pastes
-    editor.addEventListener('paste', (e) => {
-      const items = e.clipboardData && e.clipboardData.items;
-      if (!items) return;
-
-      let hasImage = false;
-      for (let i = 0; i < items.length; i++) {
-        const item = items[i];
-        if (item.type && item.type.startsWith('image/')) {
-          hasImage = true;
-          e.preventDefault();
-          const file = item.getAsFile();
-          if (!file) continue;
-
-          const reader = new FileReader();
-          reader.onload = function(ev) {
-            const dataUri = ev.target.result;
-            // Send to extension to save as file, then we'll get the path back
-            vscode.postMessage({
-              type: 'imagePasted',
-              dataUri: dataUri,
-              mimeType: item.type,
-            });
-          };
-          reader.readAsDataURL(file);
-          break;  // One image at a time
-        }
-      }
-
-      if (!hasImage) {
-        // For text paste, ensure plain text only
-        e.preventDefault();
-        const text = e.clipboardData.getData('text/plain');
-        if (text) {
-          document.execCommand('insertText', false, text);
-        }
-      }
-    });
-
-    // Prevent drag-and-drop (VS Code webview limitation)
-    editor.addEventListener('dragover', (e) => e.preventDefault());
-    editor.addEventListener('drop', (e) => e.preventDefault());
-
-    // Browse files button
+    browseFiles.addEventListener('mousedown', rememberSelection);
     browseFiles.addEventListener('click', () => {
+      rememberSelection();
       vscode.postMessage({ type: 'browseFiles' });
     });
 
-    // Toggle preview button
+    pasteImageBtn.addEventListener('click', () => {
+      rememberSelection();
+      vscode.postMessage({ type: 'pasteImage' });
+    });
+
     togglePreview.addEventListener('click', () => {
       showPreview = !showPreview;
       togglePreview.classList.toggle('active', showPreview);
-      rebuildImageDisplay();
+      scanImagePaths();
     });
-    // Initialize toggle state
-    togglePreview.classList.toggle('active', showPreview);
 
-    // Global keyboard shortcuts
     window.addEventListener('keydown', (e) => {
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key === 'Enter') {
         e.preventDefault();
-        const blocks = extractBlocks();
-        vscode.postMessage({ type: 'submit', blocks });
+        vscode.postMessage({ type: 'submit', text: input.value });
       }
       if (e.key === 'Escape') {
         e.preventDefault();
@@ -1037,40 +905,44 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
       }
     });
 
-    // Handle messages from extension
     window.addEventListener('message', (e) => {
       const msg = e.data;
 
       if (msg.type === 'terminalSwitched') {
         currentTerminalId = msg.terminalId;
-        editor.innerHTML = msg.content || '';
+        input.value = msg.content;
         target.textContent = msg.name;
-        // Re-attach remove listeners to any image blocks
-        reattachImageListeners();
         updateCounter();
-        editor.focus();
-        placeCaretAtEnd(editor);
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+        rememberSelection();
+        imagePreviews.clear();
+        scheduleScanForImages();
       }
 
       if (msg.type === 'insertFilePaths') {
-        const paths = Array.isArray(msg.paths)
-          ? msg.paths.filter((p) => typeof p === 'string' && p.length > 0)
-          : [];
+        const paths = Array.isArray(msg.paths) ? msg.paths.filter(p => typeof p === 'string' && p.length > 0) : [];
         if (paths.length > 0) {
-          // Insert as text at caret
-          document.execCommand('insertText', false, paths.join(' '));
-          updateCounter();
-          notifyDraftChanged();
+          insertAtSelection(paths.join(' '));
+        } else {
+          input.focus();
         }
-        editor.focus();
+        // Store any image previews
+        const previews = msg.imagePreviews || [];
+        for (const img of previews) {
+          imagePreviews.set(img.path, { dataUri: img.dataUri, fileName: img.fileName });
+        }
+        if (previews.length > 0) {
+          scheduleScanForImages();
+        }
       }
 
-      if (msg.type === 'insertImages') {
+      if (msg.type === 'imagePreviewsResolved') {
         const images = msg.images || [];
         for (const img of images) {
-          insertImageAtCaret(img.path, img.dataUri, img.fileName);
+          imagePreviews.set(img.path, { dataUri: img.dataUri, fileName: img.fileName });
         }
-        editor.focus();
+        scanImagePaths();
       }
 
       if (msg.type === 'status') {
@@ -1081,35 +953,24 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
         } else {
           status.style.color = '';
         }
-        editor.classList.add('disabled');
+        input.classList.add('disabled');
         browseFiles.disabled = true;
+        pasteImageBtn.disabled = true;
         togglePreview.disabled = true;
       }
 
       if (msg.type === 'resetStatus') {
         status.className = '';
-        editor.classList.remove('disabled');
+        input.classList.remove('disabled');
         browseFiles.disabled = false;
+        pasteImageBtn.disabled = false;
         togglePreview.disabled = false;
       }
     });
 
-    function reattachImageListeners() {
-      editor.querySelectorAll('.image-block-remove, .image-chip-remove').forEach((btn) => {
-        btn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          const block = btn.closest('.image-block') || btn.closest('.image-chip');
-          if (block) {
-            block.remove();
-            updateCounter();
-            notifyDraftChanged();
-          }
-        });
-      });
-    }
-
-    // Initial counter
+    // Initial scan
     updateCounter();
+    scheduleScanForImages();
   </script>
 </body>
 </html>`;
