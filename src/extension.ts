@@ -525,247 +525,114 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
   const escaped = escapeHtml(initialContent);
   const charCount = [...initialContent].length;
 
-  return `<!DOCTYPE html>
+  return /* html */ `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <title>Claude Paste</title>
 <style>
-  :root {
-    --cp-radius: 6px;
-    --cp-transition: 150ms ease;
-  }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-
   body {
     background: var(--vscode-editor-background);
     color: var(--vscode-editor-foreground);
-    font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
-    display: flex;
-    flex-direction: column;
-    height: 100vh;
-    padding: 14px 16px;
-    overflow: hidden;
+    font-family: var(--vscode-editor-font-family);
+    display: flex; flex-direction: column;
+    height: 100vh; padding: 12px;
   }
-
-  /* ── Header ────────── */
   .header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding-bottom: 10px;
-    border-bottom: 1px solid color-mix(in srgb, var(--vscode-panel-border) 60%, transparent);
-    margin-bottom: 10px;
-    flex-shrink: 0;
+    display: flex; align-items: center; justify-content: space-between;
+    padding-bottom: 8px; border-bottom: 1px solid var(--vscode-panel-border); margin-bottom: 8px;
   }
-  .header-left { display: flex; align-items: center; gap: 10px; }
-  .header h2 { font-size: 13px; font-weight: 600; letter-spacing: 0.01em; opacity: 0.88; }
-  .header-icon { font-size: 15px; opacity: 0.7; }
+  .header h2 { font-size: 14px; font-weight: 600; opacity: 0.9; }
   .target {
-    font-size: 11px; font-weight: 500; opacity: 0.7;
-    background: var(--vscode-badge-background);
-    color: var(--vscode-badge-foreground);
-    padding: 2px 10px; border-radius: 99px;
+    font-size: 12px; opacity: 0.6;
+    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
+    padding: 2px 8px; border-radius: 10px;
   }
-
-  /* ── Status ────────── */
-  #status {
-    display: none; text-align: center; padding: 8px;
-    font-size: 12px; font-weight: 500; opacity: 0.85;
-    flex-shrink: 0; border-radius: var(--cp-radius); margin-bottom: 6px;
-    background: color-mix(in srgb, var(--vscode-editor-foreground) 5%, transparent);
-  }
+  #status { display: none; text-align: center; padding: 8px; font-size: 13px; opacity: 0.8; }
   #status.active { display: block; }
-
-  /* ── Image Preview Strip ─── */
   #image-strip {
-    display: none; flex-shrink: 0; max-height: 260px; overflow-y: auto;
-    margin-bottom: 8px; border-radius: var(--cp-radius);
-    border: 1px solid color-mix(in srgb, var(--vscode-panel-border) 50%, transparent);
-    background: color-mix(in srgb, var(--vscode-editor-background) 60%, var(--vscode-input-background));
+    display: none; max-height: 200px; overflow-y: auto; margin-bottom: 6px;
+    border: 1px solid var(--vscode-panel-border); border-radius: 4px;
+    background: var(--vscode-input-background);
   }
   #image-strip.visible { display: block; }
-  #image-strip::-webkit-scrollbar { width: 6px; }
-  #image-strip::-webkit-scrollbar-track { background: transparent; }
-  #image-strip::-webkit-scrollbar-thumb {
-    background: color-mix(in srgb, var(--vscode-editor-foreground) 15%, transparent);
-    border-radius: 99px;
-  }
-
   .img-card {
-    display: flex; align-items: center; gap: 10px; padding: 8px 10px;
-    border-bottom: 1px solid color-mix(in srgb, var(--vscode-panel-border) 30%, transparent);
-    animation: cp-slide-in 200ms ease-out;
+    display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+    border-bottom: 1px solid var(--vscode-panel-border); font-size: 12px;
   }
   .img-card:last-child { border-bottom: none; }
-
-  .img-card-thumb {
-    width: 48px; height: 48px; border-radius: 4px;
-    object-fit: cover; flex-shrink: 0; cursor: pointer;
-    background: color-mix(in srgb, var(--vscode-editor-foreground) 5%, transparent);
-    transition: transform var(--cp-transition);
-  }
-  .img-card-thumb:hover { transform: scale(1.05); }
-
+  .img-card-thumb { width: 40px; height: 40px; border-radius: 3px; object-fit: cover; flex-shrink: 0; cursor: pointer; }
   .img-card-info { flex: 1; min-width: 0; overflow: hidden; }
-  .img-card-name {
-    font-size: 12px; font-weight: 500; opacity: 0.85;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .img-card-path {
-    font-size: 10px; opacity: 0.4; margin-top: 2px;
-    font-family: var(--vscode-editor-font-family, monospace);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .img-card-remove {
-    flex-shrink: 0; background: none; border: none;
-    color: var(--vscode-editor-foreground); opacity: 0.3;
-    cursor: pointer; font-size: 14px; padding: 4px 6px; border-radius: 4px;
-    transition: opacity var(--cp-transition), background var(--cp-transition);
-  }
-  .img-card-remove:hover {
-    opacity: 0.85;
-    background: color-mix(in srgb, var(--vscode-editor-foreground) 8%, transparent);
-  }
-
-  /* Expanded preview */
-  .img-expanded-overlay {
-    position: fixed; inset: 0; z-index: 100;
-    background: rgba(0,0,0,0.7); display: flex;
-    align-items: center; justify-content: center;
-    cursor: pointer; animation: cp-fade-in 150ms ease-out;
-  }
-  .img-expanded-overlay img {
-    max-width: 90%; max-height: 90%; object-fit: contain;
-    border-radius: 8px; box-shadow: 0 20px 60px rgba(0,0,0,0.5);
-  }
-
-  /* ── Textarea ──────── */
-  #input {
-    flex: 1; width: 100%; min-height: 0;
-    background: var(--vscode-input-background);
-    color: var(--vscode-input-foreground);
-    border: 1px solid var(--vscode-input-border, color-mix(in srgb, var(--vscode-panel-border) 50%, transparent));
-    border-radius: var(--cp-radius); padding: 12px 14px;
-    font-family: var(--vscode-editor-font-family, 'SF Mono', Menlo, Consolas, monospace);
-    font-size: var(--vscode-editor-font-size, 13px);
-    line-height: 1.65; resize: none; outline: none;
-    transition: border-color var(--cp-transition), box-shadow var(--cp-transition);
-  }
-  #input:focus {
-    border-color: var(--vscode-focusBorder);
-    box-shadow: 0 0 0 1px color-mix(in srgb, var(--vscode-focusBorder) 30%, transparent);
-  }
-  #input::placeholder {
-    color: var(--vscode-input-placeholderForeground, color-mix(in srgb, var(--vscode-editor-foreground) 35%, transparent));
-    font-style: italic;
-  }
-  #input.disabled { opacity: 0.45; pointer-events: none; }
-  #input::-webkit-scrollbar { width: 8px; }
-  #input::-webkit-scrollbar-track { background: transparent; }
-  #input::-webkit-scrollbar-thumb {
-    background: color-mix(in srgb, var(--vscode-editor-foreground) 18%, transparent);
-    border-radius: 99px;
-  }
-  #input::-webkit-scrollbar-thumb:hover {
-    background: color-mix(in srgb, var(--vscode-editor-foreground) 30%, transparent);
-  }
-
-  /* Paste hint toast */
+  .img-card-name { font-weight: 500; opacity: 0.85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .img-card-path { font-size: 10px; opacity: 0.4; margin-top: 1px; font-family: var(--vscode-editor-font-family, monospace); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .img-card-remove { flex-shrink: 0; background: none; border: none; color: var(--vscode-editor-foreground); opacity: 0.3; cursor: pointer; font-size: 13px; padding: 2px 4px; border-radius: 3px; }
+  .img-card-remove:hover { opacity: 0.8; }
+  .img-expanded-overlay { position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; cursor: pointer; }
+  .img-expanded-overlay img { max-width: 90%; max-height: 90%; object-fit: contain; border-radius: 6px; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
   #paste-toast {
-    display: none; position: fixed; bottom: 80px; left: 50%;
-    transform: translateX(-50%);
-    background: var(--vscode-badge-background);
-    color: var(--vscode-badge-foreground);
-    padding: 6px 14px; border-radius: 99px;
-    font-size: 11px; font-weight: 500; opacity: 0;
-    transition: opacity 200ms ease;
-    z-index: 50; pointer-events: none;
+    display: none; position: fixed; bottom: 70px; left: 50%; transform: translateX(-50%);
+    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
+    padding: 4px 12px; border-radius: 10px; font-size: 11px; opacity: 0;
+    z-index: 50; pointer-events: none; transition: opacity 200ms ease;
   }
   #paste-toast.show { display: block; opacity: 1; }
-
-  /* ── Footer ────────── */
+  #input {
+    flex: 1; width: 100%;
+    background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-input-border, transparent); border-radius: 4px;
+    padding: 12px; font-family: var(--vscode-editor-font-family, monospace);
+    font-size: var(--vscode-editor-font-size, 13px); line-height: 1.6;
+    resize: none; outline: none;
+  }
+  #input:focus { border-color: var(--vscode-focusBorder); }
+  #input::placeholder { color: var(--vscode-input-placeholderForeground); }
+  #input.disabled { opacity: 0.5; pointer-events: none; }
   .footer {
     display: flex; align-items: center; justify-content: space-between;
-    gap: 10px; padding-top: 10px; margin-top: 10px;
-    border-top: 1px solid color-mix(in srgb, var(--vscode-panel-border) 60%, transparent);
-    flex-shrink: 0;
+    gap: 12px; padding-top: 8px; margin-top: 8px;
+    border-top: 1px solid var(--vscode-panel-border);
   }
-  .footer-left { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
-  .footer-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
-  .footer .keys { font-size: 11px; opacity: 0.45; white-space: nowrap; }
+  .footer-left { display: flex; align-items: center; gap: 12px; min-width: 0; flex-wrap: wrap; }
+  .footer .keys { font-size: 12px; opacity: 0.5; }
   .footer .keys kbd {
-    background: var(--vscode-keybindingLabel-background, color-mix(in srgb, var(--vscode-editor-foreground) 8%, transparent));
-    border: 1px solid var(--vscode-keybindingLabel-border, color-mix(in srgb, var(--vscode-editor-foreground) 12%, transparent));
-    border-radius: 3px; padding: 1px 5px; font-family: inherit; font-size: 10px;
+    background: var(--vscode-keybindingLabel-background); border: 1px solid var(--vscode-keybindingLabel-border);
+    border-radius: 3px; padding: 1px 5px; font-family: inherit; font-size: 11px;
   }
-  .stat { font-size: 11px; opacity: 0.4; font-variant-numeric: tabular-nums; white-space: nowrap; }
-
-  /* ── Buttons ───────── */
   button {
-    border: 1px solid var(--vscode-button-border, transparent);
-    border-radius: var(--cp-radius); padding: 4px 10px;
-    font-family: inherit; font-size: 11px; font-weight: 500;
-    line-height: 18px; cursor: pointer;
-    transition: background var(--cp-transition), opacity var(--cp-transition);
-    white-space: nowrap;
+    border: 1px solid var(--vscode-button-border, transparent); border-radius: 4px;
+    padding: 4px 10px; font-family: inherit; font-size: 12px; line-height: 18px; cursor: pointer;
   }
-  button.secondary {
-    background: var(--vscode-button-secondaryBackground);
-    color: var(--vscode-button-secondaryForeground);
-  }
+  button.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
   button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
-  button.toggle {
-    background: transparent;
-    border: 1px solid color-mix(in srgb, var(--vscode-panel-border) 80%, transparent);
-    color: var(--vscode-editor-foreground); opacity: 0.55;
-    font-size: 11px; padding: 3px 8px;
-  }
-  button.toggle:hover { opacity: 0.85; }
-  button.toggle.active {
-    opacity: 0.9;
-    background: color-mix(in srgb, var(--vscode-focusBorder) 12%, transparent);
-    border-color: var(--vscode-focusBorder);
-  }
+  button.toggle { background: transparent; border: 1px solid var(--vscode-panel-border); color: var(--vscode-editor-foreground); opacity: 0.5; padding: 3px 8px; font-size: 11px; }
+  button.toggle:hover { opacity: 0.8; }
+  button.toggle.active { opacity: 0.9; border-color: var(--vscode-focusBorder); }
   button:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
-  button:disabled { cursor: default; opacity: 0.4; }
-
-  @keyframes cp-fade-in { from { opacity: 0; } to { opacity: 1; } }
-  @keyframes cp-slide-in {
-    from { opacity: 0; transform: translateY(-6px); }
-    to   { opacity: 1; transform: translateY(0); }
-  }
+  button:disabled { cursor: default; opacity: 0.5; }
+  #char-count { font-size: 12px; opacity: 0.5; }
 </style>
 </head>
 <body>
   <div class="header">
-    <div class="header-left">
-      <span class="header-icon">📋</span>
-      <h2>Claude Paste</h2>
-    </div>
+    <h2>Claude Paste</h2>
     <span class="target" id="target">${escapeHtml(terminalName)}</span>
   </div>
-
   <div id="status"></div>
   <div id="image-strip"></div>
-  <div id="paste-toast">Checking clipboard for image…</div>
-
-  <textarea id="input" placeholder="Paste your content here… (text and images are both supported)" autofocus>${escaped}</textarea>
-
+  <div id="paste-toast"></div>
+  <textarea id="input" placeholder="Paste your content here..." autofocus>${escaped}</textarea>
   <div class="footer">
     <div class="footer-left">
-      <button id="browse-files" class="secondary" type="button" title="Insert file or folder paths at cursor">Browse Files…</button>
-      <button id="toggle-preview" class="toggle" type="button" title="Toggle image preview display">👁 Preview</button>
+      <button id="browse-files" class="secondary" type="button" title="Insert file or folder paths at cursor">Browse Files...</button>
+      <button id="toggle-preview" class="toggle active" type="button" title="Toggle image preview">👁 Preview</button>
       <div class="keys">
-        <kbd>⌘↵</kbd> Insert &nbsp;
+        <kbd>Cmd+Enter</kbd> Insert &nbsp;
         <kbd>Esc</kbd> Cancel
       </div>
     </div>
-    <div class="footer-right">
-      <span class="stat" id="char-count">${charCount} chars</span>
-    </div>
+    <span id="char-count">${charCount} chars</span>
   </div>
-
   <script>
     const vscode = acquireVsCodeApi();
     const input = document.getElementById('input');
@@ -776,73 +643,28 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     const browseFiles = document.getElementById('browse-files');
     const togglePreview = document.getElementById('toggle-preview');
     const pasteToast = document.getElementById('paste-toast');
-
     let currentTerminalId = ${JSON.stringify(tid)};
     let showPreview = true;
     let lastSelectionStart = input.value.length;
     let lastSelectionEnd = input.value.length;
     let scanTimer = null;
     let toastTimer = null;
-
-    // Image previews: path -> { dataUri, fileName }
     const imagePreviews = new Map();
 
     input.focus();
     input.setSelectionRange(input.value.length, input.value.length);
-    togglePreview.classList.toggle('active', showPreview);
-
-    // ── Utility ──────────────────────────────
 
     function updateCounter() {
-      const text = input.value;
-      const chars = [...text].length;
-      const bytes = new TextEncoder().encode(text).length;
-      counter.textContent = bytes !== chars
-        ? chars + ' chars \\u00b7 ' + formatBytes(bytes)
-        : chars + ' chars';
+      counter.textContent = [...input.value].length + ' chars';
     }
-
-    function formatBytes(b) {
-      if (b < 1024) return b + ' B';
-      if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
-      return (b / 1048576).toFixed(1) + ' MB';
-    }
-
     function rememberSelection() {
       lastSelectionStart = input.selectionStart;
       lastSelectionEnd = input.selectionEnd;
     }
-
     function notifyDraftChanged() {
       vscode.postMessage({ type: 'draftChanged', text: input.value, terminalId: currentTerminalId });
     }
-
-    function insertAtCursor(text) {
-      const start = Math.max(0, Math.min(lastSelectionStart, input.value.length));
-      const end = Math.max(start, Math.min(lastSelectionEnd, input.value.length));
-
-      // Ensure we're on a new line for image paths
-      let prefix = '';
-      if (start > 0 && input.value[start - 1] !== '\\n') {
-        prefix = '\\n';
-      }
-      let suffix = '';
-      if (end < input.value.length && input.value[end] !== '\\n') {
-        suffix = '\\n';
-      }
-
-      const insertion = prefix + text + suffix;
-      input.value = input.value.slice(0, start) + insertion + input.value.slice(end);
-      const cursor = start + insertion.length;
-      input.focus();
-      input.setSelectionRange(cursor, cursor);
-      rememberSelection();
-      updateCounter();
-      notifyDraftChanged();
-      scheduleScanForImages();
-    }
-
-    function insertTextAtSelection(text) {
+    function insertAtSelection(text) {
       const start = Math.max(0, Math.min(lastSelectionStart, input.value.length));
       const end = Math.max(start, Math.min(lastSelectionEnd, input.value.length));
       input.value = input.value.slice(0, start) + text + input.value.slice(end);
@@ -852,33 +674,40 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
       rememberSelection();
       updateCounter();
       notifyDraftChanged();
+    }
+    function insertQuotedPath(filePath) {
+      insertAtSelection("'" + filePath + "' ");
       scheduleScanForImages();
     }
-
-    function showToast(msg, duration) {
+    function showToast(msg, dur) {
       pasteToast.textContent = msg;
       pasteToast.classList.add('show');
       if (toastTimer) clearTimeout(toastTimer);
-      toastTimer = setTimeout(() => pasteToast.classList.remove('show'), duration || 2000);
+      toastTimer = setTimeout(() => pasteToast.classList.remove('show'), dur || 2000);
     }
-
     function escapeH(s) {
       const d = document.createElement('div');
       d.textContent = s;
       return d.innerHTML;
     }
+    function isImageUrl(text) {
+      if (!text) return false;
+      const t = text.trim();
+      if (!t.startsWith('http://') && !t.startsWith('https://')) return false;
+      return /\\.(png|jpe?g|gif|webp)(\\?|#|$)/i.test(t);
+    }
 
-    // ── Image path scanning ──────────────────
-
-    const IMG_RE = /(?:^|[\\s])((?:\\/|\\.\\/|~\\/)[^\\s]+\\.(?:png|jpe?g|gif|webp))(?=[\\s]|$)/gim;
+    // ── Image scanning (looks for 'path.png' patterns) ──
+    const IMG_RE = /'([^']+\\.(?:png|jpe?g|gif|webp))'/gi;
 
     function scanImagePaths() {
       const text = input.value;
       const paths = [];
+      const seen = new Set();
       let m;
       IMG_RE.lastIndex = 0;
       while ((m = IMG_RE.exec(text)) !== null) {
-        paths.push(m[1]);
+        if (!seen.has(m[1])) { seen.add(m[1]); paths.push(m[1]); }
       }
       const unknown = paths.filter(p => !imagePreviews.has(p));
       if (unknown.length > 0) {
@@ -886,14 +715,12 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
       }
       renderImageStrip(paths);
     }
-
     function scheduleScanForImages() {
       if (scanTimer) clearTimeout(scanTimer);
       scanTimer = setTimeout(scanImagePaths, 400);
     }
 
-    // ── Image strip rendering ────────────────
-
+    // ── Image strip ──
     function renderImageStrip(paths) {
       if (!showPreview || paths.length === 0) {
         imageStrip.innerHTML = '';
@@ -906,188 +733,114 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
         imageStrip.classList.remove('visible');
         return;
       }
-
       imageStrip.innerHTML = visible.map(p => {
         const info = imagePreviews.get(p);
         return '<div class="img-card" data-path="' + escapeH(p) + '">' +
           '<img class="img-card-thumb" src="' + info.dataUri + '" alt="' + escapeH(info.fileName) + '" title="Click to enlarge" />' +
-          '<div class="img-card-info">' +
-            '<div class="img-card-name">' + escapeH(info.fileName) + '</div>' +
-            '<div class="img-card-path">' + escapeH(p) + '</div>' +
-          '</div>' +
-          '<button class="img-card-remove" title="Remove from text">\\u2715</button>' +
-        '</div>';
+          '<div class="img-card-info"><div class="img-card-name">' + escapeH(info.fileName) + '</div><div class="img-card-path">' + escapeH(p) + '</div></div>' +
+          '<button class="img-card-remove" title="Remove">✕</button></div>';
       }).join('');
-
       imageStrip.classList.add('visible');
-
-      imageStrip.querySelectorAll('.img-card-thumb').forEach(thumb => {
-        thumb.addEventListener('click', () => showExpandedImage(thumb.src, thumb.alt));
+      imageStrip.querySelectorAll('.img-card-thumb').forEach(t => {
+        t.addEventListener('click', () => {
+          const o = document.createElement('div');
+          o.className = 'img-expanded-overlay';
+          o.innerHTML = '<img src="' + t.src + '" />';
+          o.addEventListener('click', () => o.remove());
+          document.body.appendChild(o);
+        });
       });
       imageStrip.querySelectorAll('.img-card-remove').forEach(btn => {
         btn.addEventListener('click', () => {
           const card = btn.closest('.img-card');
-          const imgPath = card.dataset.path;
-          removePathFromTextarea(imgPath);
-          imagePreviews.delete(imgPath);
-          scheduleScanForImages();
+          const p = card.dataset.path;
+          // Remove quoted path from textarea
+          const esc = p.replace(/[.*+?^\${}()|[\\]\\\\]/g, '\\\\$&');
+          input.value = input.value.replace(new RegExp("'" + esc + "'\\\\s?", 'g'), '');
+          imagePreviews.delete(p);
+          updateCounter(); notifyDraftChanged(); scheduleScanForImages();
         });
       });
     }
 
-    function removePathFromTextarea(imgPath) {
-      const esc = imgPath.replace(/[.*+?^\${}()|[\\]\\\\]/g, '\\\\$&');
-      const re = new RegExp('\\\\n?' + esc + '\\\\n?', 'g');
-      input.value = input.value.replace(re, '\\n').replace(/^\\n+|\\n+$/g, '');
-      updateCounter();
-      notifyDraftChanged();
-    }
-
-    function showExpandedImage(src, alt) {
-      const overlay = document.createElement('div');
-      overlay.className = 'img-expanded-overlay';
-      overlay.innerHTML = '<img src="' + src + '" alt="' + escapeH(alt || '') + '" />';
-      overlay.addEventListener('click', () => overlay.remove());
-      document.body.appendChild(overlay);
-    }
-
-    // ── Paste handler: auto-detect images ────
-
+    // ── Paste handler ──
     input.addEventListener('paste', (e) => {
       const textData = (e.clipboardData && e.clipboardData.getData('text/plain')) || '';
-
-      // For pure image paste (no text), prevent default since textarea can't handle it.
+      if (isImageUrl(textData.trim())) {
+        e.preventDefault();
+        showToast('Downloading image…', 5000);
+        vscode.postMessage({ type: 'checkClipboardImage', pastedText: textData });
+        return;
+      }
       if (textData.length === 0) {
         e.preventDefault();
+        showToast('Checking clipboard…', 5000);
+        vscode.postMessage({ type: 'checkClipboardImage', pastedText: '' });
+        return;
       }
-
-      // ALWAYS tell extension to check clipboard.
-      // Sends the pasted text so extension can:
-      //   1. Check native clipboard for image data (screenshots)
-      //   2. Detect if pasted text is an image URL and download it
-      showToast('Checking clipboard for image…', 5000);
+      // Normal text — also check for native image
       vscode.postMessage({ type: 'checkClipboardImage', pastedText: textData });
     });
 
-    // ── Event listeners ──────────────────────
-
-    input.addEventListener('input', () => {
-      rememberSelection();
-      updateCounter();
-      notifyDraftChanged();
-      scheduleScanForImages();
-    });
+    // ── Event listeners ──
+    input.addEventListener('input', () => { rememberSelection(); updateCounter(); notifyDraftChanged(); scheduleScanForImages(); });
     input.addEventListener('click', rememberSelection);
     input.addEventListener('keyup', rememberSelection);
     input.addEventListener('select', rememberSelection);
     input.addEventListener('focus', rememberSelection);
-
     browseFiles.addEventListener('mousedown', rememberSelection);
-    browseFiles.addEventListener('click', () => {
-      rememberSelection();
-      vscode.postMessage({ type: 'browseFiles' });
-    });
-
-    togglePreview.addEventListener('click', () => {
-      showPreview = !showPreview;
-      togglePreview.classList.toggle('active', showPreview);
-      scanImagePaths();
-    });
+    browseFiles.addEventListener('click', () => { rememberSelection(); vscode.postMessage({ type: 'browseFiles' }); });
+    togglePreview.addEventListener('click', () => { showPreview = !showPreview; togglePreview.classList.toggle('active', showPreview); scanImagePaths(); });
 
     window.addEventListener('keydown', (e) => {
-      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key === 'Enter') {
-        e.preventDefault();
-        vscode.postMessage({ type: 'submit', text: input.value });
-      }
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        vscode.postMessage({ type: 'cancel' });
-      }
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key === 'Enter') { e.preventDefault(); vscode.postMessage({ type: 'submit', text: input.value }); }
+      if (e.key === 'Escape') { e.preventDefault(); vscode.postMessage({ type: 'cancel' }); }
     });
 
     window.addEventListener('message', (e) => {
       const msg = e.data;
-
       if (msg.type === 'terminalSwitched') {
         currentTerminalId = msg.terminalId;
         input.value = msg.content;
         target.textContent = msg.name;
-        updateCounter();
-        input.focus();
+        updateCounter(); input.focus();
         input.setSelectionRange(input.value.length, input.value.length);
-        rememberSelection();
-        imagePreviews.clear();
-        scheduleScanForImages();
+        rememberSelection(); imagePreviews.clear(); scheduleScanForImages();
       }
-
       if (msg.type === 'insertFilePaths') {
         const paths = Array.isArray(msg.paths) ? msg.paths.filter(p => typeof p === 'string' && p.length > 0) : [];
         if (paths.length > 0) {
-          insertTextAtSelection(paths.join(' '));
-        } else {
-          input.focus();
-        }
+          insertAtSelection(paths.map(p => "'" + p + "'").join(' ') + ' ');
+        } else { input.focus(); }
         const previews = msg.imagePreviews || [];
-        for (const img of previews) {
-          imagePreviews.set(img.path, { dataUri: img.dataUri, fileName: img.fileName });
-        }
+        for (const img of previews) { imagePreviews.set(img.path, { dataUri: img.dataUri, fileName: img.fileName }); }
         if (previews.length > 0) scheduleScanForImages();
       }
-
       if (msg.type === 'clipboardImageResult') {
         pasteToast.classList.remove('show');
         if (msg.found) {
-          if (msg.replaceText && msg.originalText) {
-            // Replace the pasted URL with the local path
-            const val = input.value;
-            const idx = val.lastIndexOf(msg.originalText);
-            if (idx !== -1) {
-              input.value = val.slice(0, idx) + msg.path + val.slice(idx + msg.originalText.length);
-            } else {
-              insertAtCursor(msg.path);
-            }
-          } else {
-            // Native clipboard image — insert path at cursor
-            insertAtCursor(msg.path);
-          }
+          insertQuotedPath(msg.path);
           imagePreviews.set(msg.path, { dataUri: msg.dataUri, fileName: msg.fileName });
           scheduleScanForImages();
-          updateCounter();
-          notifyDraftChanged();
           showToast('Image pasted ✓', 1500);
         }
-        // If not found, silently do nothing
       }
-
       if (msg.type === 'imagePreviewsResolved') {
-        const images = msg.images || [];
-        for (const img of images) {
-          imagePreviews.set(img.path, { dataUri: img.dataUri, fileName: img.fileName });
-        }
+        for (const img of (msg.images || [])) { imagePreviews.set(img.path, { dataUri: img.dataUri, fileName: img.fileName }); }
         scanImagePaths();
       }
-
       if (msg.type === 'status') {
-        status.textContent = msg.text;
-        status.className = 'active';
-        status.style.color = msg.text === 'Done'
-          ? 'var(--vscode-terminal-ansiGreen, #4ec9b0)' : '';
-        input.classList.add('disabled');
-        browseFiles.disabled = true;
-        togglePreview.disabled = true;
+        status.textContent = msg.text; status.className = 'active';
+        status.style.color = msg.text === 'Done' ? 'var(--vscode-terminal-ansiGreen, #4ec9b0)' : '';
+        input.classList.add('disabled'); browseFiles.disabled = true; togglePreview.disabled = true;
       }
-
       if (msg.type === 'resetStatus') {
-        status.className = '';
-        input.classList.remove('disabled');
-        browseFiles.disabled = false;
-        togglePreview.disabled = false;
+        status.className = ''; input.classList.remove('disabled'); browseFiles.disabled = false; togglePreview.disabled = false;
       }
     });
-
-    updateCounter();
-    scheduleScanForImages();
+    updateCounter(); scheduleScanForImages();
   </script>
 </body>
 </html>`;
 }
+
