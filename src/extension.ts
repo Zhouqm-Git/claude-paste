@@ -3,6 +3,13 @@ import * as fs from "fs";
 import * as path from "path";
 import * as child_process from "child_process";
 import * as os from "os";
+
+// Debug output channel
+let outputChannel: vscode.OutputChannel;
+function log(msg: string) {
+  if (!outputChannel) outputChannel = vscode.window.createOutputChannel("Claude Paste");
+  outputChannel.appendLine(`[${new Date().toISOString()}] ${msg}`);
+}
 import { OperationCancelled, sendChunked, normalizeText, sleep } from "./chunker";
 
 let activePanel: vscode.WebviewPanel | null = null;
@@ -93,11 +100,13 @@ async function pasteImageFromClipboard(): Promise<string | undefined> {
   const fileName = `paste-${timestamp}.png`;
   const filePath = path.join(storageDir, fileName);
 
+  log(`Attempting clipboard image grab → ${filePath}`);
+
   // Method 1: pngpaste (fast, if installed)
   if (tryPngPaste(filePath)) return filePath;
 
-  // Method 2: osascript + AppKit bridge (built-in on macOS, no install needed)
-  if (tryOsascriptAppKit(filePath)) return filePath;
+  // Method 2: osascript + JXA (built-in on macOS, no install needed)
+  if (tryOsascriptJXA(filePath)) return filePath;
 
   // Method 3: xclip (Linux)
   if (tryXclip(filePath)) return filePath;
@@ -114,41 +123,62 @@ async function pasteImageFromClipboard(): Promise<string | undefined> {
 function tryPngPaste(outputPath: string): boolean {
   try {
     child_process.execSync(`pngpaste "${outputPath}" 2>/dev/null`, { timeout: 3000 });
-    return fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0;
-  } catch {
+    const ok = fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0;
+    log(`pngpaste: ${ok ? 'success' : 'no image'}`);
+    return ok;
+  } catch (e) {
+    log(`pngpaste: not available (${e instanceof Error ? e.message : e})`);
     return false;
   }
 }
 
-function tryOsascriptAppKit(outputPath: string): boolean {
-  // Use AppleScript with Objective-C bridge — built into macOS, no external tools
-  const script = `
-use framework "AppKit"
-set pb to current application's NSPasteboard's generalPasteboard()
-set imgClasses to {current application's NSImage}
-if (pb's canReadObjectForClasses:imgClasses options:(missing value)) then
-  set imgList to (pb's readObjectsForClasses:imgClasses options:(missing value))
-  set img to item 1 of imgList
-  set tiffData to img's TIFFRepresentation()
-  set rep to (current application's NSBitmapImageRep's imageRepWithData:tiffData)
-  set pngData to (rep's representationUsingType:(current application's NSBitmapImageTypePNG) properties:(missing value))
-  pngData's writeToFile:"${outputPath}" atomically:true
-  return "ok"
-else
-  return "no_image"
-end if
-`;
+function tryOsascriptJXA(outputPath: string): boolean {
+  // Use JXA (JavaScript for Automation) — built into macOS, no external tools
+  // JXA avoids the encoding issues with AppleScript's «class PNGf» syntax
+  const safePath = outputPath.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const script = [
+    "ObjC.import('AppKit');",
+    "var pb = $.NSPasteboard.generalPasteboard;",
+    "",
+    "// Try PNG first",
+    "var data = pb.dataForType($.NSPasteboardTypePNG);",
+    "if (data && !data.isNil()) {",
+    `  data.writeToFileAtomically('${safePath}', true);`,
+    "  'ok_png';",
+    "} else {",
+    "  // Try TIFF (screenshots, Preview copies, etc.) and convert to PNG",
+    "  data = pb.dataForType($.NSPasteboardTypeTIFF);",
+    "  if (data && !data.isNil()) {",
+    "    var rep = $.NSBitmapImageRep.imageRepWithData(data);",
+    "    if (rep && !rep.isNil()) {",
+    "      var pngData = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());",
+    "      if (pngData && !pngData.isNil()) {",
+    `        pngData.writeToFileAtomically('${safePath}', true);`,
+    "        'ok_tiff_to_png';",
+    "      } else { 'convert_failed'; }",
+    "    } else { 'rep_failed'; }",
+    "  } else { 'no_image'; }",
+    "}",
+  ].join("\n");
+
   try {
-    const result = child_process.spawnSync("osascript", ["-"], {
+    const result = child_process.spawnSync("osascript", ["-l", "JavaScript", "-"], {
       input: script,
-      timeout: 5000,
+      timeout: 8000,
       encoding: "utf8",
     });
-    const output = (result.stdout || "").trim();
-    if (output === "ok" && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+    const stdout = (result.stdout || "").trim();
+    const stderr = (result.stderr || "").trim();
+    log(`osascript JXA: stdout=${stdout}, stderr=${stderr ? stderr.slice(0, 200) : '(none)'}`);
+
+    if (stdout.startsWith("ok") && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+      log(`osascript JXA: success, saved ${fs.statSync(outputPath).size} bytes`);
       return true;
     }
-  } catch {}
+    log(`osascript JXA: no image (${stdout})`);
+  } catch (e) {
+    log(`osascript JXA: error (${e instanceof Error ? e.message : e})`);
+  }
   return false;
 }
 
@@ -831,17 +861,22 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     // ── Paste handler: auto-detect images ────
 
     input.addEventListener('paste', (e) => {
-      // Check if this paste contains text
       const textData = (e.clipboardData && e.clipboardData.getData('text/plain')) || '';
 
+      // ALWAYS check clipboard for image data (even when text exists).
+      // Scenarios:
+      //   - Pure image (screenshot) → no text, clipboard has image → insert path
+      //   - Web image copy → text is URL, clipboard ALSO has image → insert path
+      //   - Pure text → no image in clipboard → extension returns found:false → nothing happens
+      //
+      // For pure image paste, prevent default (textarea can't handle images).
+      // For text paste, let textarea handle text normally AND check for image.
       if (textData.length === 0) {
-        // No text pasted → likely an image in clipboard
-        // Prevent default (nothing useful would happen anyway)
         e.preventDefault();
-        showToast('Checking clipboard for image…', 3000);
-        vscode.postMessage({ type: 'checkClipboardImage' });
       }
-      // If text exists, let textarea handle it normally (v1 behavior preserved)
+
+      showToast('Checking clipboard for image…', 4000);
+      vscode.postMessage({ type: 'checkClipboardImage', hasText: textData.length > 0 });
     });
 
     // ── Event listeners ──────────────────────
