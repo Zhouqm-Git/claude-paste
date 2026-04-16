@@ -4,7 +4,7 @@ A VS Code extension that lets you paste **large text and images** into Claude Co
 
 Works in **VS Code**, **Cursor**, **Windsurf**, and any VS Code-based IDE.
 
-https://github.com/user-attachments/assets/placeholder.mp4
+https://github.com/Zhouqm-Git/claude-paste/raw/master/assets/claude_paste_demo.mp4
 
 > **Demo**: Pasting a large code file and a screenshot into Claude Code via Claude Paste.
 
