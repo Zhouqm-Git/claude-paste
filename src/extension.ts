@@ -625,7 +625,7 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
   <div class="footer">
     <div class="footer-left">
       <button id="browse-files" class="secondary" type="button" title="Insert file or folder paths at cursor">Browse Files...</button>
-      <button id="toggle-preview" class="toggle active" type="button" title="Toggle image preview">👁 Preview</button>
+      <button id="toggle-preview" class="toggle active" type="button" title="Toggle image preview">Preview</button>
       <div class="keys">
         <kbd>Cmd+Enter</kbd> Insert &nbsp;
         <kbd>Esc</kbd> Cancel
