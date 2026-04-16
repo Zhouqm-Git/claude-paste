@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as child_process from "child_process";
-import * as os from "os";
+import * as crypto from "crypto";
 
 // Debug output channel
 let outputChannel: vscode.OutputChannel;
@@ -56,7 +56,14 @@ function terminalId(term: vscode.Terminal): string {
   return id;
 }
 
+function generateNonce(): string {
+  return crypto.randomBytes(16).toString("base64");
+}
+
 const IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".gif", ".webp"];
+
+/** Unified image URL extensions — used by both backend and frontend (via injection). */
+const IMAGE_URL_EXTENSIONS_REGEX = /\.(png|jpe?g|gif|webp)(\?|$)/i;
 
 function isImageFile(filePath: string): boolean {
   const ext = path.extname(filePath).toLowerCase();
@@ -94,7 +101,8 @@ function ensureStorageDir(storageDir: string): void {
 
 /**
  * Try to grab an image from the system clipboard and save it.
- * Uses built-in macOS osascript (no brew install needed), with pngpaste as fast fallback.
+ * Platform-aware: only runs the tools relevant to the current OS.
+ * All methods are async (non-blocking).
  */
 async function pasteImageFromClipboard(): Promise<string | undefined> {
   const storageDir = getImageStorageDir();
@@ -107,17 +115,17 @@ async function pasteImageFromClipboard(): Promise<string | undefined> {
 
   log(`Attempting clipboard image grab → ${filePath}`);
 
-  // Method 1: pngpaste (fast, if installed)
-  if (tryPngPaste(filePath)) return filePath;
+  const platform = process.platform;
 
-  // Method 2: osascript + JXA (built-in on macOS, no install needed)
-  if (tryOsascriptJXA(filePath)) return filePath;
-
-  // Method 3: xclip (Linux)
-  if (tryXclip(filePath)) return filePath;
-
-  // Method 4: PowerShell (Windows)
-  if (tryPowerShell(filePath)) return filePath;
+  if (platform === "darwin") {
+    // macOS: try pngpaste (fast), then osascript JXA
+    if (await tryPngPaste(filePath)) return filePath;
+    if (await tryOsascriptJXA(filePath)) return filePath;
+  } else if (platform === "linux") {
+    if (await tryXclip(filePath)) return filePath;
+  } else if (platform === "win32") {
+    if (await tryPowerShell(filePath)) return filePath;
+  }
 
   // Cleanup empty file if any method created one
   try { if (fs.existsSync(filePath) && fs.statSync(filePath).size === 0) fs.unlinkSync(filePath); } catch {}
@@ -125,82 +133,101 @@ async function pasteImageFromClipboard(): Promise<string | undefined> {
   return undefined;
 }
 
-function tryPngPaste(outputPath: string): boolean {
-  try {
-    child_process.execSync(`pngpaste "${outputPath}" 2>/dev/null`, { timeout: 3000 });
-    const ok = fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0;
-    log(`pngpaste: ${ok ? 'success' : 'no image'}`);
-    return ok;
-  } catch (e) {
-    log(`pngpaste: not available (${e instanceof Error ? e.message : e})`);
-    return false;
-  }
-}
-
-function tryOsascriptJXA(outputPath: string): boolean {
-  // Use JXA (JavaScript for Automation) — built into macOS, no external tools
-  // JXA avoids the encoding issues with AppleScript's «class PNGf» syntax
-  const safePath = outputPath.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-  const script = [
-    "ObjC.import('AppKit');",
-    "var pb = $.NSPasteboard.generalPasteboard;",
-    "",
-    "// Try PNG first",
-    "var data = pb.dataForType($.NSPasteboardTypePNG);",
-    "if (data && !data.isNil()) {",
-    `  data.writeToFileAtomically('${safePath}', true);`,
-    "  'ok_png';",
-    "} else {",
-    "  // Try TIFF (screenshots, Preview copies, etc.) and convert to PNG",
-    "  data = pb.dataForType($.NSPasteboardTypeTIFF);",
-    "  if (data && !data.isNil()) {",
-    "    var rep = $.NSBitmapImageRep.imageRepWithData(data);",
-    "    if (rep && !rep.isNil()) {",
-    "      var pngData = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());",
-    "      if (pngData && !pngData.isNil()) {",
-    `        pngData.writeToFileAtomically('${safePath}', true);`,
-    "        'ok_tiff_to_png';",
-    "      } else { 'convert_failed'; }",
-    "    } else { 'rep_failed'; }",
-    "  } else { 'no_image'; }",
-    "}",
-  ].join("\n");
-
-  try {
-    const result = child_process.spawnSync("osascript", ["-l", "JavaScript", "-"], {
-      input: script,
-      timeout: 8000,
-      encoding: "utf8",
+function tryPngPaste(outputPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    child_process.execFile("pngpaste", [outputPath], { timeout: 3000 }, (err) => {
+      if (err) {
+        log(`pngpaste: not available (${err.message})`);
+        resolve(false);
+        return;
+      }
+      const ok = fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0;
+      log(`pngpaste: ${ok ? 'success' : 'no image'}`);
+      resolve(ok);
     });
-    const stdout = (result.stdout || "").trim();
-    const stderr = (result.stderr || "").trim();
-    log(`osascript JXA: stdout=${stdout}, stderr=${stderr ? stderr.slice(0, 200) : '(none)'}`);
-
-    if (stdout.startsWith("ok") && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
-      log(`osascript JXA: success, saved ${fs.statSync(outputPath).size} bytes`);
-      return true;
-    }
-    log(`osascript JXA: no image (${stdout})`);
-  } catch (e) {
-    log(`osascript JXA: error (${e instanceof Error ? e.message : e})`);
-  }
-  return false;
+  });
 }
 
-function tryXclip(outputPath: string): boolean {
-  try {
-    child_process.execSync(
+function tryOsascriptJXA(outputPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    // Use JXA (JavaScript for Automation) — built into macOS, no external tools
+    // JXA avoids the encoding issues with AppleScript's «class PNGf» syntax
+    const safePath = outputPath.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const script = [
+      "ObjC.import('AppKit');",
+      "var pb = $.NSPasteboard.generalPasteboard;",
+      "",
+      "// Try PNG first",
+      "var data = pb.dataForType($.NSPasteboardTypePNG);",
+      "if (data && !data.isNil()) {",
+      `  data.writeToFileAtomically('${safePath}', true);`,
+      "  'ok_png';",
+      "} else {",
+      "  // Try TIFF (screenshots, Preview copies, etc.) and convert to PNG",
+      "  data = pb.dataForType($.NSPasteboardTypeTIFF);",
+      "  if (data && !data.isNil()) {",
+      "    var rep = $.NSBitmapImageRep.imageRepWithData(data);",
+      "    if (rep && !rep.isNil()) {",
+      "      var pngData = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());",
+      "      if (pngData && !pngData.isNil()) {",
+      `        pngData.writeToFileAtomically('${safePath}', true);`,
+      "        'ok_tiff_to_png';",
+      "      } else { 'convert_failed'; }",
+      "    } else { 'rep_failed'; }",
+      "  } else { 'no_image'; }",
+      "}",
+    ].join("\n");
+
+    const child = child_process.spawn("osascript", ["-l", "JavaScript", "-"], {
+      timeout: 8000,
+    });
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    child.stdin.write(script);
+    child.stdin.end();
+
+    child.on("error", (e) => {
+      log(`osascript JXA: error (${e.message})`);
+      resolve(false);
+    });
+
+    child.on("close", () => {
+      stdout = stdout.trim();
+      stderr = stderr.trim();
+      log(`osascript JXA: stdout=${stdout}, stderr=${stderr ? stderr.slice(0, 200) : '(none)'}`);
+
+      if (stdout.startsWith("ok") && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+        log(`osascript JXA: success, saved ${fs.statSync(outputPath).size} bytes`);
+        resolve(true);
+      } else {
+        log(`osascript JXA: no image (${stdout})`);
+        resolve(false);
+      }
+    });
+  });
+}
+
+function tryXclip(outputPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    child_process.exec(
       `xclip -selection clipboard -t image/png -o > "${outputPath}" 2>/dev/null`,
-      { timeout: 3000, shell: "/bin/bash" }
+      { timeout: 3000, shell: "/bin/bash" },
+      (err) => {
+        if (err) {
+          resolve(false);
+          return;
+        }
+        resolve(fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0);
+      }
     );
-    return fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0;
-  } catch {
-    return false;
-  }
+  });
 }
 
-function tryPowerShell(outputPath: string): boolean {
-  try {
+function tryPowerShell(outputPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
     const psScript = `
 $img = Get-Clipboard -Format Image
 if ($img) {
@@ -209,11 +236,15 @@ if ($img) {
 } else {
   Write-Output 'no_image'
 }`;
-    const result = child_process.execSync(`powershell -Command "${psScript}"`, { timeout: 5000 }).toString().trim();
-    return result === "ok" && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0;
-  } catch {
-    return false;
-  }
+    child_process.exec(`powershell -Command "${psScript}"`, { timeout: 5000 }, (err, stdout) => {
+      if (err) {
+        resolve(false);
+        return;
+      }
+      const result = (stdout || "").trim();
+      resolve(result === "ok" && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0);
+    });
+  });
 }
 
 async function readImageAsDataUri(filePath: string): Promise<string | undefined> {
@@ -228,6 +259,7 @@ async function readImageAsDataUri(filePath: string): Promise<string | undefined>
 
 /**
  * Check if a string looks like an image URL.
+ * Uses the unified IMAGE_URL_EXTENSIONS_REGEX (no .bmp/.svg — not supported by Claude Code).
  */
 function isImageUrl(text: string): boolean {
   if (!text) return false;
@@ -236,54 +268,104 @@ function isImageUrl(text: string): boolean {
   // Check URL path for image extension (ignore query params)
   try {
     const url = new URL(trimmed);
-    return /\.(png|jpe?g|gif|webp|bmp|svg)(\?|$)/i.test(url.pathname);
+    return IMAGE_URL_EXTENSIONS_REGEX.test(url.pathname);
   } catch {
-    return /\.(png|jpe?g|gif|webp)(\?|$)/i.test(trimmed);
+    return IMAGE_URL_EXTENSIONS_REGEX.test(trimmed);
   }
 }
 
+/** Minimum file size (bytes) to consider a download as a real image. */
+const MIN_IMAGE_BYTES = 100;
+
+/** Map Content-Type to file extension. */
+function extFromContentType(contentType: string): string | undefined {
+  const ct = contentType.toLowerCase().split(";")[0].trim();
+  const map: Record<string, string> = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+  };
+  return map[ct];
+}
+
 /**
- * Download an image from a URL and save it locally.
+ * Download an image from a URL and save it locally (async, non-blocking).
+ * Validates HTTP status code, Content-Type, and file size.
+ * File extension is derived from Content-Type header (#F).
  */
 async function downloadImageFromUrl(imageUrl: string): Promise<string | undefined> {
   const storageDir = getImageStorageDir();
   if (!storageDir) return undefined;
   ensureStorageDir(storageDir);
 
-  // Determine filename from URL
-  let ext = ".png";
-  try {
-    const url = new URL(imageUrl);
-    const urlPath = url.pathname;
-    const match = urlPath.match(/\.(png|jpe?g|gif|webp)$/i);
-    if (match) ext = match[0].toLowerCase();
-  } catch {}
-
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const fileName = `web-${timestamp}${ext}`;
-  const filePath = path.join(storageDir, fileName);
+  // Use a temporary name; we'll rename based on Content-Type
+  const tmpFileName = `web-${timestamp}.tmp`;
+  const tmpFilePath = path.join(storageDir, tmpFileName);
 
   log(`Downloading image from URL: ${imageUrl}`);
-  log(`Saving to: ${filePath}`);
+  log(`Saving to: ${tmpFilePath}`);
 
   try {
-    const result = child_process.spawnSync("curl", [
-      "-sL",           // silent, follow redirects
-      "--max-time", "10",  // 10 second timeout
-      "-o", filePath,
-      imageUrl,
-    ], { timeout: 15000 });
+    const { httpCode, contentType } = await new Promise<{ httpCode: string; contentType: string }>((resolve, reject) => {
+      const child = child_process.spawn("curl", [
+        "-sL",           // silent, follow redirects
+        "--max-time", "10",  // 10 second timeout
+        "-o", tmpFilePath,
+        "-w", "%{http_code} %{content_type}",  // output status + content-type
+        imageUrl,
+      ], { timeout: 15000 });
 
-    if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
-      log(`Download success: ${fs.statSync(filePath).size} bytes`);
-      return filePath;
+      let stdout = "";
+      child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+      child.on("error", (e) => reject(e));
+      child.on("close", () => {
+        const trimmed = stdout.trim();
+        const spaceIdx = trimmed.indexOf(" ");
+        resolve({
+          httpCode: spaceIdx > 0 ? trimmed.slice(0, spaceIdx) : trimmed,
+          contentType: spaceIdx > 0 ? trimmed.slice(spaceIdx + 1) : "",
+        });
+      });
+    });
+
+    log(`Download curl output: httpCode=${httpCode}, contentType=${contentType}`);
+
+    // Validate HTTP status code
+    if (httpCode !== "200") {
+      log(`Download rejected: HTTP ${httpCode}`);
+      try { if (fs.existsSync(tmpFilePath)) fs.unlinkSync(tmpFilePath); } catch {}
+      return undefined;
     }
-    log(`Download failed: file empty or missing. stderr=${(result.stderr || "").toString().slice(0, 200)}`);
+
+    // Validate Content-Type — must be present AND an image type (#4 fix: empty = reject)
+    if (!contentType || !extFromContentType(contentType)) {
+      log(`Download rejected: Content-Type '${contentType}' is missing or not an image`);
+      try { if (fs.existsSync(tmpFilePath)) fs.unlinkSync(tmpFilePath); } catch {}
+      return undefined;
+    }
+
+    // Validate file exists and has a reasonable size
+    if (!fs.existsSync(tmpFilePath) || fs.statSync(tmpFilePath).size <= MIN_IMAGE_BYTES) {
+      log(`Download failed: file empty or too small`);
+      try { if (fs.existsSync(tmpFilePath)) fs.unlinkSync(tmpFilePath); } catch {}
+      return undefined;
+    }
+
+    // Derive extension from Content-Type (not URL) (#F)
+    const ext = extFromContentType(contentType) || ".png";
+    const finalFileName = `web-${timestamp}${ext}`;
+    const finalFilePath = path.join(storageDir, finalFileName);
+    fs.renameSync(tmpFilePath, finalFilePath);
+
+    log(`Download success: ${fs.statSync(finalFilePath).size} bytes → ${finalFileName}`);
+    return finalFilePath;
   } catch (e) {
     log(`Download error: ${e instanceof Error ? e.message : e}`);
   }
 
-  try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+  try { if (fs.existsSync(tmpFilePath)) fs.unlinkSync(tmpFilePath); } catch {}
   return undefined;
 }
 
@@ -326,6 +408,9 @@ function openPastePanel(context: vscode.ExtensionContext) {
 
   let isSubmitting = false;
   let isCancelled = false;
+
+  // Track the latest clipboard request ID to discard stale results (#2)
+  let latestClipboardRequestId = 0;
 
   const changeDisposable = vscode.window.onDidChangeActiveTerminal((term) => {
     if (isCancelled || isSubmitting) return;
@@ -399,15 +484,32 @@ function openPastePanel(context: vscode.ExtensionContext) {
     // --- CHECK CLIPBOARD FOR IMAGE (auto-triggered on paste) ---
     if (msg.type === "checkClipboardImage") {
       const pastedText = (msg.pastedText || "").trim();
-      log(`checkClipboardImage: pastedText="${pastedText.slice(0, 100)}"`);
+      const requestId: number = msg.requestId || 0;
+      latestClipboardRequestId = requestId;
+      log(`checkClipboardImage: requestId=${requestId}, pastedText="${pastedText.slice(0, 100)}"`);
+
+      // Helper: check if this request is still valid (not stale, not cancelled)
+      const isStale = () => requestId !== latestClipboardRequestId;
+      const isAborted = () => isCancelled || isStale();
 
       // Strategy 1: Check native clipboard for image data (screenshots, etc.)
       const nativePath = await pasteImageFromClipboard();
+
+      // Discard stale/cancelled result (#2, #E)
+      if (isAborted()) {
+        log(`Discarding clipboard result (request ${requestId}, cancelled=${isCancelled}, stale=${isStale()})`);
+        if (nativePath) {
+          try { fs.unlinkSync(nativePath); } catch {}
+        }
+        return;
+      }
+
       if (nativePath) {
         log(`Native clipboard image found: ${nativePath}`);
         const dataUri = await readImageAsDataUri(nativePath);
         panel.webview.postMessage({
           type: "clipboardImageResult",
+          requestId,
           found: true,
           path: nativePath,
           dataUri: dataUri || "",
@@ -421,10 +523,21 @@ function openPastePanel(context: vscode.ExtensionContext) {
       if (isImageUrl(pastedText)) {
         log(`Pasted text is image URL, downloading: ${pastedText}`);
         const downloadedPath = await downloadImageFromUrl(pastedText);
+
+        // Check staleness/cancellation again after download (#2, #E)
+        if (isAborted()) {
+          log(`Discarding download result (request ${requestId}, cancelled=${isCancelled}, stale=${isStale()})`);
+          if (downloadedPath) {
+            try { fs.unlinkSync(downloadedPath); } catch {}
+          }
+          return;
+        }
+
         if (downloadedPath) {
           const dataUri = await readImageAsDataUri(downloadedPath);
           panel.webview.postMessage({
             type: "clipboardImageResult",
+            requestId,
             found: true,
             path: downloadedPath,
             dataUri: dataUri || "",
@@ -434,10 +547,20 @@ function openPastePanel(context: vscode.ExtensionContext) {
           });
           return;
         }
+
+        // Download failed — tell frontend so it can keep the URL text (#B)
+        panel.webview.postMessage({
+          type: "clipboardImageResult",
+          requestId,
+          found: false,
+          downloadFailed: true,
+          originalText: pastedText,
+        });
+        return;
       }
 
       log("No image found in clipboard or URL");
-      panel.webview.postMessage({ type: "clipboardImageResult", found: false });
+      panel.webview.postMessage({ type: "clipboardImageResult", requestId, found: false });
       return;
     }
 
@@ -488,7 +611,9 @@ function openPastePanel(context: vscode.ExtensionContext) {
 
       try {
         if (term.exitStatus) {
+          // Terminal closed between button press and here — reset UI (#C)
           isSubmitting = false;
+          panel.webview.postMessage({ type: "resetStatus" });
           vscode.window.showErrorMessage(`Terminal "${displayName(term)}" has closed.`);
           return;
         }
@@ -498,6 +623,9 @@ function openPastePanel(context: vscode.ExtensionContext) {
           return;
         }
         vscode.window.showErrorMessage("Failed to paste — terminal may have closed.");
+        // Reset UI before disposing so user sees the error (#C)
+        isSubmitting = false;
+        panel.webview.postMessage({ type: "resetStatus" });
         panel.dispose();
         return;
       }
@@ -524,13 +652,15 @@ function openPastePanel(context: vscode.ExtensionContext) {
 function getWebviewHtml(initialContent: string, terminalName: string, tid: string): string {
   const escaped = escapeHtml(initialContent);
   const charCount = [...initialContent].length;
+  const nonce = generateNonce();
 
   return /* html */ `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
 <title>Claude Paste</title>
-<style>
+<style nonce="${nonce}">
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
     background: var(--vscode-editor-background);
@@ -633,7 +763,7 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     </div>
     <span id="char-count">${charCount} chars</span>
   </div>
-  <script>
+  <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const input = document.getElementById('input');
     const counter = document.getElementById('char-count');
@@ -649,6 +779,7 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
     let lastSelectionEnd = input.value.length;
     let scanTimer = null;
     let toastTimer = null;
+    let clipboardRequestId = 0;
     const imagePreviews = new Map();
 
     input.focus();
@@ -685,11 +816,7 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
       if (toastTimer) clearTimeout(toastTimer);
       toastTimer = setTimeout(() => pasteToast.classList.remove('show'), dur || 2000);
     }
-    function escapeH(s) {
-      const d = document.createElement('div');
-      d.textContent = s;
-      return d.innerHTML;
-    }
+    /** Frontend isImageUrl — unified with backend: png|jpg|jpeg|gif|webp only */
     function isImageUrl(text) {
       if (!text) return false;
       const t = text.trim();
@@ -697,17 +824,22 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
       return /\\.(png|jpe?g|gif|webp)(\\?|#|$)/i.test(t);
     }
 
-    // ── Image scanning (looks for 'path.png' patterns) ──
-    const IMG_RE = /'([^']+\\.(?:png|jpe?g|gif|webp))'/gi;
+    // ── Image scanning — supports 'path', "path", and bare paths (#5) ──
+    const IMG_SINGLE = /'([^']+\\.(?:png|jpe?g|gif|webp))'/gi;
+    const IMG_DOUBLE = /"([^"]+\\.(?:png|jpe?g|gif|webp))"/gi;
+    // Bare paths: absolute (/path) or relative (./path, ../path, ~/path)
+    const IMG_BARE   = /(?:^|[\\s,;])((?:\\.{0,2}|~)?\\/(?:[\\w.~-]+\\/)*[\\w.-]+\\.(?:png|jpe?g|gif|webp))(?=[\\s,;]|$)/gim;
 
     function scanImagePaths() {
       const text = input.value;
       const paths = [];
       const seen = new Set();
-      let m;
-      IMG_RE.lastIndex = 0;
-      while ((m = IMG_RE.exec(text)) !== null) {
-        if (!seen.has(m[1])) { seen.add(m[1]); paths.push(m[1]); }
+      for (const re of [IMG_SINGLE, IMG_DOUBLE, IMG_BARE]) {
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(text)) !== null) {
+          if (!seen.has(m[1])) { seen.add(m[1]); paths.push(m[1]); }
+        }
       }
       const unknown = paths.filter(p => !imagePreviews.has(p));
       if (unknown.length > 0) {
@@ -720,66 +852,111 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
       scanTimer = setTimeout(scanImagePaths, 400);
     }
 
-    // ── Image strip ──
+    // ── Image strip (DOM API, no innerHTML for card construction) (#9) ──
+    function createImageCard(p) {
+      const info = imagePreviews.get(p);
+      if (!info) return null;
+
+      const card = document.createElement('div');
+      card.className = 'img-card';
+      card.dataset.path = p;
+
+      const thumb = document.createElement('img');
+      thumb.className = 'img-card-thumb';
+      thumb.src = info.dataUri;
+      thumb.alt = info.fileName;
+      thumb.title = 'Click to enlarge';
+      thumb.addEventListener('click', () => {
+        const overlay = document.createElement('div');
+        overlay.className = 'img-expanded-overlay';
+        const bigImg = document.createElement('img');
+        bigImg.src = thumb.src;
+        overlay.appendChild(bigImg);
+        overlay.addEventListener('click', () => overlay.remove());
+        document.body.appendChild(overlay);
+      });
+      card.appendChild(thumb);
+
+      const infoDiv = document.createElement('div');
+      infoDiv.className = 'img-card-info';
+      const nameDiv = document.createElement('div');
+      nameDiv.className = 'img-card-name';
+      nameDiv.textContent = info.fileName;
+      infoDiv.appendChild(nameDiv);
+      const pathDiv = document.createElement('div');
+      pathDiv.className = 'img-card-path';
+      pathDiv.textContent = p;
+      infoDiv.appendChild(pathDiv);
+      card.appendChild(infoDiv);
+
+      const removeBtn = document.createElement('button');
+      removeBtn.className = 'img-card-remove';
+      removeBtn.title = 'Remove';
+      removeBtn.textContent = '✕';
+      removeBtn.addEventListener('click', () => {
+        // Remove path from textarea — handle single-quoted, double-quoted, and bare
+        // Use split/join to avoid regex escaping issues in template literals
+        input.value = input.value.split("'" + p + "' ").join('');
+        input.value = input.value.split("'" + p + "'").join('');
+        input.value = input.value.split('"' + p + '" ').join('');
+        input.value = input.value.split('"' + p + '"').join('');
+        input.value = input.value.split(p + ' ').join('');
+        input.value = input.value.split(p).join('');
+        imagePreviews.delete(p);
+        updateCounter(); notifyDraftChanged(); scheduleScanForImages();
+      });
+      card.appendChild(removeBtn);
+
+      return card;
+    }
+
     function renderImageStrip(paths) {
+      // Clear children using DOM API
+      while (imageStrip.firstChild) { imageStrip.removeChild(imageStrip.firstChild); }
+
       if (!showPreview || paths.length === 0) {
-        imageStrip.innerHTML = '';
         imageStrip.classList.remove('visible');
         return;
       }
       const visible = paths.filter(p => imagePreviews.has(p));
       if (visible.length === 0) {
-        imageStrip.innerHTML = '';
         imageStrip.classList.remove('visible');
         return;
       }
-      imageStrip.innerHTML = visible.map(p => {
-        const info = imagePreviews.get(p);
-        return '<div class="img-card" data-path="' + escapeH(p) + '">' +
-          '<img class="img-card-thumb" src="' + info.dataUri + '" alt="' + escapeH(info.fileName) + '" title="Click to enlarge" />' +
-          '<div class="img-card-info"><div class="img-card-name">' + escapeH(info.fileName) + '</div><div class="img-card-path">' + escapeH(p) + '</div></div>' +
-          '<button class="img-card-remove" title="Remove">✕</button></div>';
-      }).join('');
+      for (const p of visible) {
+        const card = createImageCard(p);
+        if (card) imageStrip.appendChild(card);
+      }
       imageStrip.classList.add('visible');
-      imageStrip.querySelectorAll('.img-card-thumb').forEach(t => {
-        t.addEventListener('click', () => {
-          const o = document.createElement('div');
-          o.className = 'img-expanded-overlay';
-          o.innerHTML = '<img src="' + t.src + '" />';
-          o.addEventListener('click', () => o.remove());
-          document.body.appendChild(o);
-        });
-      });
-      imageStrip.querySelectorAll('.img-card-remove').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const card = btn.closest('.img-card');
-          const p = card.dataset.path;
-          // Remove quoted path from textarea
-          const esc = p.replace(/[.*+?^\${}()|[\\]\\\\]/g, '\\\\$&');
-          input.value = input.value.replace(new RegExp("'" + esc + "'\\\\s?", 'g'), '');
-          imagePreviews.delete(p);
-          updateCounter(); notifyDraftChanged(); scheduleScanForImages();
-        });
-      });
     }
 
-    // ── Paste handler ──
+    // ── Paste handler (#1: no longer triggers checkClipboardImage for normal text) ──
     input.addEventListener('paste', (e) => {
       const textData = (e.clipboardData && e.clipboardData.getData('text/plain')) || '';
       if (isImageUrl(textData.trim())) {
-        e.preventDefault();
+        // Image URL — let URL text enter textarea normally (don't preventDefault!)
+        // Then download in background; on success replace URL with local path, on failure keep URL (#B)
+        const reqId = ++clipboardRequestId;
         showToast('Downloading image…', 5000);
-        vscode.postMessage({ type: 'checkClipboardImage', pastedText: textData });
+        // Use setTimeout so the browser paste completes first
+        setTimeout(() => {
+          rememberSelection(); updateCounter(); notifyDraftChanged();
+          vscode.postMessage({ type: 'checkClipboardImage', pastedText: textData.trim(), requestId: reqId });
+        }, 0);
         return;
       }
       if (textData.length === 0) {
+        // No text in clipboard — might be a screenshot/image, check native clipboard
         e.preventDefault();
+        const reqId = ++clipboardRequestId;
         showToast('Checking clipboard…', 5000);
-        vscode.postMessage({ type: 'checkClipboardImage', pastedText: '' });
+        vscode.postMessage({ type: 'checkClipboardImage', pastedText: '', requestId: reqId });
         return;
       }
-      // Normal text — also check for native image
-      vscode.postMessage({ type: 'checkClipboardImage', pastedText: textData });
+      // Normal text paste — invalidate any pending clipboard request (#D)
+      ++clipboardRequestId;
+      // Let the browser handle it, just schedule image path scanning
+      setTimeout(() => { rememberSelection(); updateCounter(); notifyDraftChanged(); scheduleScanForImages(); }, 0);
     });
 
     // ── Event listeners ──
@@ -817,12 +994,29 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
         if (previews.length > 0) scheduleScanForImages();
       }
       if (msg.type === 'clipboardImageResult') {
+        // Discard stale results (#2)
+        if (msg.requestId !== undefined && msg.requestId !== clipboardRequestId) return;
         pasteToast.classList.remove('show');
         if (msg.found) {
-          insertQuotedPath(msg.path);
+          if (msg.replaceText && msg.originalText) {
+            // Replace the URL text that was already pasted into the textarea (#B)
+            const urlText = msg.originalText;
+            const idx = input.value.indexOf(urlText);
+            if (idx !== -1) {
+              input.value = input.value.slice(0, idx) + "'" + msg.path + "'" + input.value.slice(idx + urlText.length);
+            } else {
+              // URL not found (user may have edited), just append
+              insertQuotedPath(msg.path);
+            }
+          } else {
+            insertQuotedPath(msg.path);
+          }
           imagePreviews.set(msg.path, { dataUri: msg.dataUri, fileName: msg.fileName });
-          scheduleScanForImages();
+          updateCounter(); notifyDraftChanged(); scheduleScanForImages();
           showToast('Image pasted ✓', 1500);
+        } else if (msg.downloadFailed) {
+          // Download failed — URL text is already in textarea, just show error (#B)
+          showToast('Image download failed — URL kept', 3000);
         }
       }
       if (msg.type === 'imagePreviewsResolved') {
@@ -843,4 +1037,3 @@ function getWebviewHtml(initialContent: string, terminalName: string, tid: strin
 </body>
 </html>`;
 }
-

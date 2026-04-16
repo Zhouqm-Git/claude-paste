@@ -2,7 +2,7 @@
   "name": "claude-paste",
   "displayName": "Claude Paste",
   "description": "Paste large text into Claude Code (and other CLI agents) without freezing the terminal",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "license": "MIT",
   "keywords": ["claude", "paste", "terminal", "ai", "cli"],
   "engines": { "vscode": "^1.85.0" },
